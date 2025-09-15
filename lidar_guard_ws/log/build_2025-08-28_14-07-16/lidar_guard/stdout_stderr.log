@@ -1,0 +1,30 @@
+running develop
+running egg_info
+creating lidar_guard.egg-info
+writing lidar_guard.egg-info/PKG-INFO
+writing dependency_links to lidar_guard.egg-info/dependency_links.txt
+writing entry points to lidar_guard.egg-info/entry_points.txt
+writing requirements to lidar_guard.egg-info/requires.txt
+writing top-level names to lidar_guard.egg-info/top_level.txt
+writing manifest file 'lidar_guard.egg-info/SOURCES.txt'
+reading manifest file 'lidar_guard.egg-info/SOURCES.txt'
+writing manifest file 'lidar_guard.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/andrei/lidar_guard_ws/install/lidar_guard/lib/python3.12/site-packages/lidar-guard.egg-link (link to .)
+Installing fake_scan_node script to /home/andrei/lidar_guard_ws/install/lidar_guard/lib/lidar_guard
+Installing guard_node script to /home/andrei/lidar_guard_ws/install/lidar_guard/lib/lidar_guard
+Installing gui_node script to /home/andrei/lidar_guard_ws/install/lidar_guard/lib/lidar_guard
+
+Installed /home/andrei/lidar_guard_ws/build/lidar_guard
+running symlink_data
+creating /home/andrei/lidar_guard_ws/install/lidar_guard/share/ament_index
+creating /home/andrei/lidar_guard_ws/install/lidar_guard/share/ament_index/resource_index
+creating /home/andrei/lidar_guard_ws/install/lidar_guard/share/ament_index/resource_index/packages
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/resource/lidar_guard -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/ament_index/resource_index/packages
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/package.xml -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard
+creating /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard/config
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/config/lidar.yaml -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard/config
+creating /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard/launch
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/launch/guard_demo.launch.py -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard/launch
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/launch/guard_gui_demo.launch.py -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard/launch
+symbolically linking /home/andrei/lidar_guard_ws/build/lidar_guard/README.md -> /home/andrei/lidar_guard_ws/install/lidar_guard/share/lidar_guard

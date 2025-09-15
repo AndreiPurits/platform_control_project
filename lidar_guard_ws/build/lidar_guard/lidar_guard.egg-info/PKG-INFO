@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: lidar-guard
+Version: 0.1.0
+Summary: Safety guard for lidar with STOP output.
+Maintainer: Andrei
+Maintainer-email: andrei@example.com
+License: MIT
