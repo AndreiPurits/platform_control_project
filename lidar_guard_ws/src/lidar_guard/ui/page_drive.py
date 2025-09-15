@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtWidgets, QtCore, QtGui
 from state import AppState
+from radar_heatmap import RadarHeatmap
 from graphics import (
     ensure_scene, prepare_view,
     redraw_drive_overlays,         # рисует флаги/маршрут на DRIVE
@@ -21,7 +22,13 @@ class DrivePage:
         self.radarViewDrive: QtWidgets.QGraphicsView = ui.findChild(QtWidgets.QGraphicsView, "radarViewDrive")
         ensure_scene(self.mapViewDrive);  prepare_view(self.mapViewDrive)
         ensure_scene(self.radarViewDrive);prepare_view(self.radarViewDrive)
-
+        self._heatmap = RadarHeatmap(
+            self.radarViewDrive,
+            meters_span=12.0,   # тут задаёшь «сколько метров по ширине»
+            rotation_deg=90.0,  # развернуть по часовой
+            decay=0.92,
+            dot_radius_px=2
+        )
         # --- Кнопки верхнего бара ---
         self.btnStartStop: QtWidgets.QPushButton      = ui.findChild(QtWidgets.QPushButton, "btnStartStop")
         self.btnMapPicker: QtWidgets.QPushButton      = ui.findChild(QtWidgets.QPushButton, "btnMapPicker")
@@ -150,8 +157,10 @@ class DrivePage:
     def _on_points(self, pts):
         """pts — список (x,y) в метрах, в системе (x вправо, y вверх)."""
         if self.radarViewDrive and self.radarViewDrive.scene():
-            # 1 м = 40 пикселей (при желании подрегулируй)
+            # старый слой точек (оставляем)
             draw_radar_points(self.radarViewDrive.scene(), pts, meters_to_px=40.0)
+            # новый heatmap-слой
+            self._heatmap.update_from_xy(pts)
 
     # -------------------- shutdown (вызывай из Main.closeEvent) --------------------
     def shutdown(self):
