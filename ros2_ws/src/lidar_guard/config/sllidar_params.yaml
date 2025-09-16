@@ -1,0 +1,7 @@
+sllidar_node:
+  ros__parameters:
+    serial_port: "/dev/rplidar"    # или "/dev/ttyUSB0", если без udev
+    serial_baudrate: 460800        # ПОДСТАВЬ найденный рабочий baudrate
+    frame_id: "laser_frame"
+    inverted: false
+    angle_compensate: true

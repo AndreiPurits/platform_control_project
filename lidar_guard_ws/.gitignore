@@ -1,0 +1,14 @@
+# ROS 2 workspace build artifacts
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
