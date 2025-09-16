@@ -1,7 +1,0 @@
-Metadata-Version: 2.1
-Name: lidar-guard
-Version: 0.0.1
-Summary: Unified bringup: sllidar_ros2 + GUI
-Maintainer: you
-Maintainer-email: you@example.com
-License: MIT
