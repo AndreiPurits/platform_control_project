@@ -1,4 +1,0 @@
-[console_scripts]
-fake_scan_node = lidar_guard.fake_scan_node:main
-guard_node = lidar_guard.guard_node:main
-gui_node = lidar_guard.gui_node:qt_main

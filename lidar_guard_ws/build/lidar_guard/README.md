@@ -1,1 +1,0 @@
-/home/andrei/lidar_guard_ws/src/lidar_guard/README.md

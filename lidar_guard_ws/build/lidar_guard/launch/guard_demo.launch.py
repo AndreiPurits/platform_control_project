@@ -1,1 +1,0 @@
-/home/andrei/lidar_guard_ws/src/lidar_guard/launch/guard_demo.launch.py
