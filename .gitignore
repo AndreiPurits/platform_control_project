@@ -1,13 +1,14 @@
 # ROS 2 build artifacts
-build/
-install/
-log/
+**/build/
+**/install/
+**/log/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
 
-# IDE
+# OS/IDE junk
+**/.DS_Store
 .vscode/
 .idea/
