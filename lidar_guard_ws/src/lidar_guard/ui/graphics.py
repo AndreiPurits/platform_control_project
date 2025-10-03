@@ -1,193 +1,285 @@
-# graphics.py
 # -*- coding: utf-8 -*-
+"""
+== API INDEX ================================================================
+PUBLIC:
+- ensure_scene(view, pixmap=None) -> QGraphicsScene
+    Создаёт/возвращает сцену у QGraphicsView. Если дан pixmap — кладёт как фон.
+- prepare_view(view) -> None
+    Базовая настройка QGraphicsView (зум/смягчение/якоря/скроллбары).
+- show_map_on_views(png_path, idle_view, drive_view, state) -> None
+    Грузит PNG в оба вида, создаёт HUD, сбрасывает старые items маршрута.
+- ensure_hud(scene) -> (group, text_item)
+    Создаёт (если нет) HUD-плашку «Маршрут …».
+- update_hud_text(scene, text) -> None
+    Обновляет текст HUD.
+- draw_polyline_path(scene, old_item, pts, color="#e53935", width=3)
+    Рисует/перерисовывает линию маршрута.
+- redraw_route(state, ui=None) -> None
+    Берёт state.route_pts_px/route_len_m и рисует маршрут в обеих сценах + HUD.
+
+INTERACTION:
+- attach_click_router(view, state, ui, on_after_route=None) -> QObject
+    Вешает фильтр на view.viewport(): два клика → построить маршрут по графу.
+
+NOTES:
+- Всё ориентировано на графовую логику: маршруты готовит routing.build_route_snap_pixels,
+  а этот модуль отвечает только за визуализацию и клики.
+============================================================================
+"""
+
 from typing import List, Tuple, Optional
-from PyQt5 import QtWidgets, QtGui, QtCore
-from state import AppState
+from PyQt5 import QtWidgets, QtCore, QtGui
 
+Point = Tuple[float, float]
 
-# ----------- подготовка видов -----------
+# ======================================================================
+# БАЗОВАЯ РАБОТА СО СЦЕНОЙ / КАРТОЙ
+# ======================================================================
 
-def fit_view_to_pixmap(view: QtWidgets.QGraphicsView, pixmap_item: QtWidgets.QGraphicsPixmapItem):
-    if not view or not pixmap_item: return
-    br = pixmap_item.boundingRect()
-    if br.isEmpty(): return
-    view.fitInView(br, QtCore.Qt.KeepAspectRatio)
-
-# ----------- загрузка карты -----------
-def show_map_on_views(path: str,
-                      idle_view: QtWidgets.QGraphicsView,
-                      drive_view: QtWidgets.QGraphicsView,
-                      state: AppState):
-    pm = QtGui.QPixmap(path)
-    if pm.isNull(): return
-
-    # Idle
-    if idle_view and idle_view.scene():
-        sc = idle_view.scene()
+def ensure_scene(view: QtWidgets.QGraphicsView,
+                 pixmap: Optional[QtGui.QPixmap] = None) -> QtWidgets.QGraphicsScene:
+    """
+    Гарантирует наличие QGraphicsScene у view.
+    Если передан pixmap, очищает сцену и кладёт его как фон.
+    """
+    sc = view.scene()
+    if sc is None:
+        sc = QtWidgets.QGraphicsScene()
+        view.setScene(sc)
+    if pixmap is not None:
         sc.clear()
-        sc.setSceneRect(0, 0, pm.width(), pm.height())
-        state.idle_map_pixmap_item = sc.addPixmap(pm)
-        fit_view_to_pixmap(idle_view, state.idle_map_pixmap_item)
-        # перерисуем оверлеи из состояния
-        redraw_idle_overlays(state, idle_view.scene())
+        sc.addPixmap(pixmap)
+    view.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    return sc
 
-    # Drive
-    if drive_view and drive_view.scene():
-        sc = drive_view.scene()
-        sc.clear()
-        sc.setSceneRect(0, 0, pm.width(), pm.height())
-        state.drive_map_pixmap_item = sc.addPixmap(pm)
-        fit_view_to_pixmap(drive_view, state.drive_map_pixmap_item)
-        redraw_drive_overlays(state, drive_view.scene())
 
-# ----------- маркеры/маршрут -----------
-def _flag_item(scene: QtWidgets.QGraphicsScene, old_item, pos: QtCore.QPointF, color: str):
-    if old_item is not None:
-        scene.removeItem(old_item)
-    pen = QtGui.QPen(QtGui.QColor("#333")); pen.setWidth(2)
-    mast = scene.addLine(pos.x(), pos.y(), pos.x(), pos.y()-20, pen)
-    flag = scene.addPolygon(QtGui.QPolygonF([
-        QtCore.QPointF(pos.x(), pos.y()-20),
-        QtCore.QPointF(pos.x()+16, pos.y()-16),
-        QtCore.QPointF(pos.x(), pos.y()-12),
-    ]), QtGui.QPen(QtGui.QColor("#333")), QtGui.QBrush(QtGui.QColor(color)))
-    base = scene.addEllipse(pos.x()-2, pos.y()-2, 4, 4, pen, QtGui.QBrush(QtGui.QColor("#333")))
-    return scene.createItemGroup([mast, flag, base])
+def show_map_on_views(png_path: str,
+                      idle_view: Optional[QtWidgets.QGraphicsView],
+                      drive_view: Optional[QtWidgets.QGraphicsView],
+                      state) -> None:
+    """
+    Грузит PNG и показывает в обоих QGraphicsView.
+    - Создаёт/обновляет сцены.
+    - Поднимает HUD.
+    - Сбрасывает прошлые items маршрута в state.
+    """
+    pm = QtGui.QPixmap(png_path)
 
-def _cross_item(scene, old_item, pos: QtCore.QPointF, color="#d64545"):
-    if old_item is not None:
-        scene.removeItem(old_item)
-    size = 10
-    pen  = QtGui.QPen(QtGui.QColor(color)); pen.setWidth(2)
-    l1 = scene.addLine(pos.x()-size, pos.y(), pos.x()+size, pos.y(), pen)
-    l2 = scene.addLine(pos.x(), pos.y()-size, pos.x(), pos.y()+size, pen)
-    dot= scene.addEllipse(pos.x()-3, pos.y()-3, 6, 6, pen, QtGui.QBrush(QtGui.QColor(color)))
-    return scene.createItemGroup([l1, l2, dot])
+    if idle_view is not None:
+        sc_idle = ensure_scene(idle_view, pm)
+        ensure_hud(sc_idle)
+    else:
+        sc_idle = None
 
-def draw_polyline_path(scene: QtWidgets.QGraphicsScene, old_item, pts: List[Tuple[float,float]], color="#e53935"):
+    if drive_view is not None:
+        sc_drive = ensure_scene(drive_view, pm)
+        ensure_hud(sc_drive)
+    else:
+        sc_drive = None
+
+    state._idle_scene = sc_idle
+    state._drive_scene = sc_drive
+    state.idle_route_item = None
+    state.drive_route_item = None
+
+
+# ======================================================================
+# HUD
+# ======================================================================
+
+def ensure_hud(scene: QtWidgets.QGraphicsScene):
+    """
+    Создаёт (если нет) полупрозрачную плашку HUD в левом верхнем углу и текст.
+    Возвращает (group, text_item).
+    """
+    if hasattr(scene, "_route_hud_group") and scene._route_hud_group:
+        return scene._route_hud_group, scene._route_hud_text
+
+    rect = QtCore.QRectF(8, 8, 460, 46)
+    bg = scene.addRect(rect, QtGui.QPen(QtCore.Qt.NoPen),
+                       QtGui.QBrush(QtGui.QColor(0, 0, 0, 120)))
+    text = scene.addText("Маршрут не задан", QtGui.QFont("Inter", 12))
+    text.setDefaultTextColor(QtGui.QColor("#ffffff"))
+    text.setPos(16, 14)
+
+    group = scene.createItemGroup([bg, text])
+    group.setZValue(9999)
+
+    scene._route_hud_group = group
+    scene._route_hud_text = text
+    return group, text
+
+
+def update_hud_text(scene: QtWidgets.QGraphicsScene, text: str):
+    """Обновляет текст HUD, поднимая плашку при необходимости."""
+    _, t = ensure_hud(scene)
+    t.setPlainText(text)
+
+
+# ======================================================================
+# ОТРИСОВКА МАРШРУТА
+# ======================================================================
+
+def draw_polyline_path(scene: QtWidgets.QGraphicsScene,
+                       old_item: Optional[QtWidgets.QGraphicsItem],
+                       pts: List[Point],
+                       color: str = "#e53935",
+                       width: int = 3) -> Optional[QtWidgets.QGraphicsPathItem]:
+    """
+    Перерисовывает ломаную (маршрут). Возвращает добавленный item.
+    Если old_item задан и принадлежит сцене — удаляется.
+    """
     if old_item is not None and old_item.scene() is scene:
         scene.removeItem(old_item)
-    if not pts: return None
-    p = QtGui.QPainterPath(QtCore.QPointF(pts[0][0], pts[0][1]))
-    for (x,y) in pts[1:]:
-        p.lineTo(x, y)
-    pen = QtGui.QPen(QtGui.QColor(color)); pen.setWidth(3); pen.setCosmetic(True)
-    return scene.addPath(p, pen)
+    if not pts:
+        return None
 
-# ----------- перерисовка из состояния (по индексам) -----------
-def redraw_idle_overlays(state: AppState, scene: QtWidgets.QGraphicsScene):
-    # флаг робота
-    if state.robot_idx is not None and state.spline_polyline:
-        x,y = state.spline_polyline[state.robot_idx]
-        state.idle_robot_item = _flag_item(scene, state.idle_robot_item, QtCore.QPointF(x,y), color="#ffffff")
+    path = QtGui.QPainterPath(QtCore.QPointF(pts[0][0], pts[0][1]))
+    for (x, y) in pts[1:]:
+        path.lineTo(x, y)
+
+    pen = QtGui.QPen(QtGui.QColor(color))
+    pen.setWidth(width)
+    pen.setCosmetic(True)
+
+    item = scene.addPath(path, pen)
+    item.setZValue(100)  # поверх карты, но под HUD
+    return item
+
+
+def redraw_route(state, ui: Optional[QtWidgets.QMainWindow] = None) -> None:
+    """
+    Рисует текущий маршрут (px) в обеих сценах и обновляет HUD/статус-бар.
+    Ожидает, что state.route_pts_px и state.route_len_m подготовлены routing’ом.
+    """
+    for sc, holder in (
+        (getattr(state, "_idle_scene", None),  "idle_route_item"),
+        (getattr(state, "_drive_scene", None), "drive_route_item"),
+    ):
+        if sc is None:
+            continue
+        item = getattr(state, holder, None)
+        new_item = draw_polyline_path(sc, item, getattr(state, "route_pts_px", []) or [], "#e53935", 3)
+        setattr(state, holder, new_item)
+
+    # HUD + статус-бар
+    if getattr(state, "route_len_m", 0.0) > 0.0:
+        hud_text = f"Маршрут: {state.route_len_m:.1f} м"
     else:
-        if state.idle_robot_item: scene.removeItem(state.idle_robot_item); state.idle_robot_item = None
+        hud_text = "Маршрут не задан"
 
-    # цель
-    if state.goal_idx is not None and state.spline_polyline:
-        x,y = state.spline_polyline[state.goal_idx]
-        state.idle_goal_item = _cross_item(scene, state.idle_goal_item, QtCore.QPointF(x,y), color="#d64545")
-    else:
-        if state.idle_goal_item: scene.removeItem(state.idle_goal_item); state.idle_goal_item = None
+    for sc in (getattr(state, "_idle_scene", None), getattr(state, "_drive_scene", None)):
+        if sc is not None:
+            try:
+                update_hud_text(sc, hud_text)
+            except Exception:
+                pass
 
-    # маршрут
-    if state.spline_polyline and state.robot_idx is not None and state.goal_idx is not None:
-        path_pts = _path_from_indices(state.spline_polyline, state.robot_idx, state.goal_idx)
-        state.idle_route_item = draw_polyline_path(scene, state.idle_route_item, path_pts, color="#e53935")
-    else:
-        if state.idle_route_item: scene.removeItem(state.idle_route_item); state.idle_route_item = None
+    if ui and hasattr(ui, "statusBar"):
+        try:
+            ui.statusBar().showMessage(hud_text, 3000)
+        except Exception:
+            pass
 
-def redraw_drive_overlays(state: AppState, scene: QtWidgets.QGraphicsScene):
-    if state.robot_idx is not None and state.spline_polyline:
-        x,y = state.spline_polyline[state.robot_idx]
-        state.drive_robot_item = _flag_item(scene, state.drive_robot_item, QtCore.QPointF(x,y), color="#ffffff")
-    else:
-        if state.drive_robot_item: scene.removeItem(state.drive_robot_item); state.drive_robot_item = None
 
-    if state.goal_idx is not None and state.spline_polyline:
-        x,y = state.spline_polyline[state.goal_idx]
-        state.drive_goal_item = _cross_item(scene, state.drive_goal_item, QtCore.QPointF(x,y), color="#d64545")
-    else:
-        if state.drive_goal_item: scene.removeItem(state.drive_goal_item); state.drive_goal_item = None
+# ======================================================================
+# ВЗАИМОДЕЙСТВИЕ: два клика → построить маршрут
+# ======================================================================
 
-    if state.spline_polyline and state.robot_idx is not None and state.goal_idx is not None:
-        path_pts = _path_from_indices(state.spline_polyline, state.robot_idx, state.goal_idx)
-        state.drive_route_item = draw_polyline_path(scene, state.drive_route_item, path_pts, color="#e53935")
-    else:
-        if state.drive_route_item: scene.removeItem(state.drive_route_item); state.drive_route_item = None
+class _ClickRouter(QtCore.QObject):
+    """
+    Фильтр событий мыши для QGraphicsView:
+    два клика → построение маршрута через routing.build_route_snap_pixels.
+    Важно: фильтр вешается на view.viewport(), т.к. клики приходят именно туда.
+    """
+    def __init__(self, view: QtWidgets.QGraphicsView, state, ui, on_after_route=None):
+        super().__init__(view)
+        self.view = view
+        self.state = state
+        self.ui = ui
+        self._pending: List[Point] = []
+        self.on_after_route = on_after_route
 
-def _path_from_indices(poly: List[Tuple[float,float]], ia: int, ib: int) -> List[Tuple[float,float]]:
-    # локальный простой расчёт (чтобы не тянуть routing сюда)
-    if ia == ib: return [poly[ia]]
-    if ia < ib:
-        forward  = poly[ia:ib+1]
-        backward = poly[ib:] + poly[:ia+1]
-    else:
-        forward  = poly[ia:] + poly[:ib+1]
-        backward = poly[ib:ia+1]
-    return forward if len(forward) <= len(backward) else backward
+    def eventFilter(self, obj, ev):
+        # Принимаем события как от viewport, так и от самого view — на всякий случай.
+        is_target = (obj is self.view) or (self.view and obj is self.view.viewport())
+        if is_target and ev.type() == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.LeftButton:
+            # граф должен быть загружен
+            if getattr(self.state, "graph", None) is None:
+                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Граф карты не загружен")
+                return True
 
-# Удобно вызывать после смены экрана или выбора карты:
-def refresh_all_overlays(state: AppState,
-                         idle_view: QtWidgets.QGraphicsView,
-                         drive_view: QtWidgets.QGraphicsView):
-    if idle_view and idle_view.scene():
-        redraw_idle_overlays(state, idle_view.scene())
-    if drive_view and drive_view.scene():
-        redraw_drive_overlays(state, drive_view.scene())
-        
-def ensure_scene(view: QtWidgets.QGraphicsView):
-    if not view: return
-    if not isinstance(view.scene(), QtWidgets.QGraphicsScene):
-        sc = QtWidgets.QGraphicsScene(view)
-        view.setScene(sc)
-    # дефолтный прямоугольник сцены (в пикселях)
-    view.scene().setSceneRect(0, 0, 800, 600)
+            sp = self.view.mapToScene(ev.pos())
+            self._pending.append((float(sp.x()), float(sp.y())))
+
+            if len(self._pending) == 1:
+                # подсказка после первого клика
+                if self.ui and hasattr(self.ui, "statusBar"):
+                    self.ui.statusBar().showMessage("Старт выбран. Выберите точку цели.", 1500)
+                return True
+
+            if len(self._pending) >= 2:
+                a, b = self._pending[0], self._pending[1]
+                self._pending.clear()
+                try:
+                    from routing import build_route_snap_pixels, update_progress_text_for_robot
+                    ok = build_route_snap_pixels(a, b, self.state)
+                    if ok:
+                        redraw_route(self.state, self.ui)
+                        # стартовое «пройдено/осталось» от точки А
+                        try:
+                            text = update_progress_text_for_robot(a, self.state)
+                            for sc in (getattr(self.state, "_idle_scene", None),
+                                       getattr(self.state, "_drive_scene", None)):
+                                if sc is not None:
+                                    update_hud_text(sc, text)
+                            if self.ui and hasattr(self.ui, "statusBar"):
+                                self.ui.statusBar().showMessage(text, 2000)
+                        except Exception:
+                            pass
+                        if self.on_after_route:
+                            try:
+                                self.on_after_route()
+                            except Exception:
+                                pass
+                    else:
+                        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Не удалось построить маршрут")
+                except Exception as e:
+                    print("[GRAPHICS] route build error:", e)
+            return True
+        return False
+
+
+def attach_click_router(view: Optional[QtWidgets.QGraphicsView], state, ui, on_after_route=None):
+    """
+    Ставит фильтр событий на view.viewport(), чтобы пара кликов строила маршрут по графу.
+    Возвращает ссылку на фильтр (держим её у view, чтобы GC не прибрал).
+    """
+    if view is None:
+        return None
+    cr = _ClickRouter(view, state, ui, on_after_route=on_after_route)
+    # важно: именно viewport получает клики мыши
+    view.viewport().installEventFilter(cr)
+    # храним ссылку на объект в экземпляре view, чтобы не уничтожился
+    if not hasattr(view, "_click_router"):
+        view._click_router = []
+    view._click_router.append(cr)
+    return cr
+
 
 def prepare_view(view: QtWidgets.QGraphicsView):
-    if not view: return
+    """
+    Минимальная «приятная» конфигурация QGraphicsView для карт:
+    - смягчение/антиалиасинг
+    - якоря трансформации по центру
+    - скрытые скроллбары
+    - запрет перетаскивания (если нужно — поменяй на ScrollHandDrag)
+    """
+    if not view:
+        return
     view.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
     view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
     view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
     view.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
     view.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
     view.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-
-def clear_layer(scene: QtWidgets.QGraphicsScene, tag: str):
-    for it in list(scene.items()):
-        try:
-            if it.data(0) == tag:
-                scene.removeItem(it)
-        except Exception:
-            pass
-
-def draw_radar_points(scene: QtWidgets.QGraphicsScene, pts: List[Tuple[float,float]],
-                      meters_to_px: float = 40.0, tag: str = "radar"):
-    """
-    pts: в метрах, (x вправо, y вверх).
-    meters_to_px: 40 => 1 м = 40 пикселей.
-    """
-    if scene is None: return
-    clear_layer(scene, tag)
-
-    # центр сцены
-    br = scene.sceneRect()
-    cx = br.center().x()
-    cy = br.center().y()
-
-    # оси
-    ax_pen = QtGui.QPen(QtGui.QColor("#cccccc")); ax_pen.setStyle(QtCore.Qt.DotLine)
-    ax_h = scene.addLine(br.left(), cy, br.right(), cy, ax_pen); ax_h.setData(0, tag)
-    ax_v = scene.addLine(cx, br.top(), cx, br.bottom(), ax_pen); ax_v.setData(0, tag)
-
-    if not pts: return
-
-    pen = QtGui.QPen(QtGui.QColor("#00aaff")); pen.setWidth(0)
-    brush = QtGui.QBrush(QtGui.QColor("#00aaff"))
-    r = 2.0  # радиус точки в пикселях
-
-    for (mx, my) in pts:
-        x = cx + mx * meters_to_px
-        y = cy - my * meters_to_px  # инвертируем ось Y под экран
-        dot = scene.addEllipse(x-r, y-r, 2*r, 2*r, pen, brush)
-        dot.setData(0, tag)
