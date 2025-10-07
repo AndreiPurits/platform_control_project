@@ -1,316 +1,370 @@
+# routing.py
 # -*- coding: utf-8 -*-
 """
-== API INDEX ================================================================
-PUBLIC:
-- ensure_scene(view, pixmap=None) -> QGraphicsScene
-    Создаёт/возвращает сцену у QGraphicsView. Если дан pixmap — кладёт как фон.
-- prepare_view(view) -> None
-    Базовая настройка QGraphicsView (перетаскивание, антиалиасинг, якорь зума).
-- show_map_on_views(png_path, idle_view, drive_view, state) -> None
-    Грузит PNG в оба вида, сохраняет сцены в state, поднимает HUD, сбрасывает старый маршрут.
-- ensure_hud(scene) -> (group, text_item)
-    Создаёт (если нет) HUD-плашку «Маршрут / Пройдено / Осталось».
-- update_hud_text(scene, text) -> None
-    Обновляет текст HUD.
-- draw_polyline_path(scene, old_item, pts, color="#e53935", width=3) -> QGraphicsPathItem|None
-    Рисует/перерисовывает ломаную (маршрут) поверх карты.
-- redraw_route(state, ui=None) -> None
-    Главный метод отрисовки маршрута ГРАФА: берёт state.route_pts_px, рисует в обеих сценах,
-    обновляет HUD строкой "Маршрут: X м" (если доступно state.route_len_m).
-- redraw_idle_overlays(state, scene) -> None
-    Совместимый хук под старый вызов: теперь просто вызывает графовую отрисовку для idle-сцены.
-COMPAT HELPERS (маркеры робота/цели):
-- _flag_item(scene, old_item, pos_qt, color="#ffffff") -> QGraphicsItemGroup
-- _cross_item(scene, old_item, pos_qt, color="#d64545") -> QGraphicsItemGroup
+== ROUTING (новый, только graph) ============================================
+Ожидаемый формат артефактов рядом с PNG:
+  <base>_graph.json           : {"nodes":{"px":[[x,y],...], "m":[[X,Y],...]}, "edges":[{"u":int,"v":int,"poly_px":[...],"poly_m":[...]}, ...]}
+  <base>_points_pixels.json   : [[x,y], ...] — плотные точки для снэпа кликов
+  <base>_points_meters.json   : {"meters_per_pixel": float} (опционально)
 
-КОММЕНТАРИЙ ПО ЛОГИКЕ ГРАФОВ:
-- Мы предполагаем, что построение маршрута выполнено в routing.build_route_snap_pixels(...)
-  и в state заполнены:
-    state.route_pts_px : List[Tuple[float,float]]  # путь в пикселях, в системе PNG (Y вниз)
-    state.route_len_m  : float                      # длина в метрах (для HUD)
-  Дополнительно (для маркеров) могут быть заданы:
-    state.robot_px : Tuple[float,float]            # положение робота в px
-    state.goal_px  : Tuple[float,float]            # цель в px
-- Отрисовка НЕ использует сплайны и индексы; всё завязано на граф.
-============================================================================
+Основные функции:
+- load_graph_and_points_for(png_path, state) -> bool
+- set_robot_pose_px(click_px, state) -> (x,y)     # снэп к ближайшей точке из *_points_pixels.json
+- set_goal_px(click_px, state)  -> (x,y)
+- build_route_from_robot_to_goal(state) -> bool   # Дейкстра с «виртуальными» узлами как в interactive_route.py
+- redraw_all(state, idle_view, drive_view) -> None  # перерисовать маркеры + маршрут (для Main.to_idle()/to_drive())
+- route_caption_text(state) -> str                # Текст «Маршрут/Пройдено/Осталось»
+=========================================================================== 
 """
 
-from typing import List, Tuple, Optional
-from PyQt5 import QtWidgets, QtCore, QtGui
+from typing import List, Tuple, Optional, Dict, Any
+import os, json, math, heapq
 
 Point = Tuple[float, float]
 
+EDGE_POLY_KEY_PX = "poly_px"
+EDGE_POLY_KEY_M  = "poly_m"
 
-# ======================================================================
-# БАЗОВАЯ РАБОТА СО СЦЕНОЙ / КАРТОЙ
-# ======================================================================
+# ---------------- utils ----------------
+def _dist(a: Point, b: Point) -> float:
+    return math.hypot(a[0]-b[0], a[1]-b[1])
 
-def ensure_scene(view: QtWidgets.QGraphicsView,
-                 pixmap: Optional[QtGui.QPixmap] = None) -> QtWidgets.QGraphicsScene:
-    """
-    Гарантирует наличие QGraphicsScene у view.
-    Если передан pixmap, очищает сцену и кладёт его как фон.
-    """
-    sc = view.scene()
-    if sc is None:
-        sc = QtWidgets.QGraphicsScene()
-        view.setScene(sc)
-    if pixmap is not None:
-        sc.clear()
-        sc.addPixmap(pixmap)
-    view.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    return sc
+def _subpoly_idx(poly: List[Point], i0: int, i1: int) -> List[Point]:
+    if i0 <= i1:
+        return poly[i0:i1+1]
+    seg = poly[i1:i0+1]
+    seg.reverse()
+    return seg
 
-
-def prepare_view(view: QtWidgets.QGraphicsView) -> None:
-    """
-    Лёгкая дефолтная подготовка вида (чтобы внешние импорты не падали).
-    Если у тебя есть свой «умный» класс вида — эту функцию можно оставить пустой.
-    """
-    view.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    view.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
-    view.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
-
-
-def show_map_on_views(png_path: str,
-                      idle_view: Optional[QtWidgets.QGraphicsView],
-                      drive_view: Optional[QtWidgets.QGraphicsView],
-                      state) -> None:
-    """
-    Грузит PNG и показывает в обоих QGraphicsView.
-    - Создаёт/обновляет сцены.
-    - Поднимает HUD.
-    - Сбрасывает прошлые items маршрута и маркеров в state.
-    """
-    pm = QtGui.QPixmap(png_path)
-
-    if idle_view is not None:
-        sc_idle = ensure_scene(idle_view, pm)
-        ensure_hud(sc_idle)
-    else:
-        sc_idle = None
-
-    if drive_view is not None:
-        sc_drive = ensure_scene(drive_view, pm)
-        ensure_hud(sc_drive)
-    else:
-        sc_drive = None
-
-    # сохраняем ссылки на сцены и «держатели» отрисованных items
-    state._idle_scene = sc_idle
-    state._drive_scene = sc_drive
-    state.idle_route_item = None
-    state.drive_route_item = None
-    state.idle_robot_item = None
-    state.idle_goal_item = None
-    state.drive_robot_item = None
-    state.drive_goal_item = None
-
-
-# ======================================================================
-# HUD: «Маршрут / Пройдено / Осталось»
-# ======================================================================
-
-def ensure_hud(scene: QtWidgets.QGraphicsScene):
-    """
-    Создаёт (если нет) полупрозрачную плашку HUD в левом верхнем углу и текст.
-    Возвращает (group, text_item).
-    """
-    if hasattr(scene, "_route_hud_group") and scene._route_hud_group:
-        return scene._route_hud_group, scene._route_hud_text
-
-    rect = QtCore.QRectF(8, 8, 460, 46)
-    bg = scene.addRect(rect, QtGui.QPen(QtCore.Qt.NoPen),
-                       QtGui.QBrush(QtGui.QColor(0, 0, 0, 120)))
-    text = scene.addText("Маршрут не задан", QtGui.QFont("Inter", 12))
-    text.setDefaultTextColor(QtGui.QColor("#ffffff"))
-    text.setPos(16, 14)
-
-    group = scene.createItemGroup([bg, text])
-    group.setZValue(9999)
-
-    scene._route_hud_group = group
-    scene._route_hud_text = text
-    return group, text
-
-
-def update_hud_text(scene: QtWidgets.QGraphicsScene, text: str):
-    """Обновляет текст HUD, поднимая плашку при необходимости."""
-    _, t = ensure_hud(scene)
-    t.setPlainText(text)
-
-
-# ======================================================================
-# ОТРИСОВКА МАРШРУТА И МАРКЕРОВ
-# ======================================================================
-
-def draw_polyline_path(scene: QtWidgets.QGraphicsScene,
-                       old_item: Optional[QtWidgets.QGraphicsItem],
-                       pts: List[Point],
-                       color: str = "#e53935",
-                       width: int = 3) -> Optional[QtWidgets.QGraphicsPathItem]:
-    """
-    Перерисовывает ломаную (маршрут). Возвращает добавленный item.
-    Если old_item задан и принадлежит сцене — удаляется.
-    """
-    if old_item is not None and old_item.scene() is scene:
-        scene.removeItem(old_item)
-    if not pts:
-        return None
-
-    path = QtGui.QPainterPath(QtCore.QPointF(pts[0][0], pts[0][1]))
-    for (x, y) in pts[1:]:
-        path.lineTo(x, y)
-
-    pen = QtGui.QPen(QtGui.QColor(color))
-    pen.setWidth(width)
-    pen.setCosmetic(True)
-
-    item = scene.addPath(path, pen)
-    item.setZValue(100)  # поверх карты, но под HUD
-    return item
-
-
-def _flag_item(scene: QtWidgets.QGraphicsScene,
-               old_item: Optional[QtWidgets.QGraphicsItem],
-               pos: QtCore.QPointF,
-               color: str = "#ffffff") -> QtWidgets.QGraphicsItemGroup:
-    """Маркер робота (флажок)."""
-    if old_item is not None and old_item.scene() is scene:
-        scene.removeItem(old_item)
-
-    pen = QtGui.QPen(QtGui.QColor("#333"))
-    pen.setWidth(2)
-
-    mast = scene.addLine(pos.x(), pos.y(), pos.x(), pos.y() - 20, pen)
-    flag = scene.addPolygon(
-        QtGui.QPolygonF([
-            QtCore.QPointF(pos.x(), pos.y() - 20),
-            QtCore.QPointF(pos.x() + 16, pos.y() - 16),
-            QtCore.QPointF(pos.x(), pos.y() - 12),
-        ]),
-        QtGui.QPen(QtGui.QColor("#333")),
-        QtGui.QBrush(QtGui.QColor(color))
-    )
-    base = scene.addEllipse(pos.x() - 2, pos.y() - 2, 4, 4, pen, QtGui.QBrush(QtGui.QColor("#333")))
-
-    group = scene.createItemGroup([mast, flag, base])
-    group.setZValue(200)
-    return group
-
-
-def _cross_item(scene: QtWidgets.QGraphicsScene,
-                old_item: Optional[QtWidgets.QGraphicsItem],
-                pos: QtCore.QPointF,
-                color: str = "#d64545") -> QtWidgets.QGraphicsItemGroup:
-    """Маркер цели (крестик)."""
-    if old_item is not None and old_item.scene() is scene:
-        scene.removeItem(old_item)
-
-    size = 10
-    pen = QtGui.QPen(QtGui.QColor(color))
-    pen.setWidth(2)
-
-    l1 = scene.addLine(pos.x() - size, pos.y(), pos.x() + size, pos.y(), pen)
-    l2 = scene.addLine(pos.x(), pos.y() - size, pos.x(), pos.y() + size, pen)
-    dot = scene.addEllipse(pos.x() - 3, pos.y() - 3, 6, 6, pen, QtGui.QBrush(QtGui.QColor(color)))
-
-    group = scene.createItemGroup([l1, l2, dot])
-    group.setZValue(200)
-    return group
-
-
-def _draw_robot_and_goal(state) -> None:
-    """
-    Рисует/обновляет маркеры робота и цели в обеих сценах (idle/drive), если заданы:
-      state.robot_px, state.goal_px : Tuple[float,float]
-    Удаляет маркеры, если соответствующих значений нет.
-    """
-    for scene_name, robot_attr, goal_attr in (
-        ("_idle_scene",  "idle_robot_item",  "idle_goal_item"),
-        ("_drive_scene", "drive_robot_item", "drive_goal_item"),
-    ):
-        sc = getattr(state, scene_name, None)
-        if sc is None:
-            continue
-
-        # ROBOT
-        if getattr(state, "robot_px", None) is not None:
-            rx, ry = state.robot_px
-            prev = getattr(state, robot_attr, None)
-            new_item = _flag_item(sc, prev, QtCore.QPointF(rx, ry), "#ffffff")
-            setattr(state, robot_attr, new_item)
-        else:
-            prev = getattr(state, robot_attr, None)
-            if prev:
-                sc.removeItem(prev)
-            setattr(state, robot_attr, None)
-
-        # GOAL
-        if getattr(state, "goal_px", None) is not None:
-            gx, gy = state.goal_px
-            prev = getattr(state, goal_attr, None)
-            new_item = _cross_item(sc, prev, QtCore.QPointF(gx, gy), "#d64545")
-            setattr(state, goal_attr, new_item)
-        else:
-            prev = getattr(state, goal_attr, None)
-            if prev:
-                sc.removeItem(prev)
-            setattr(state, goal_attr, None)
-
-
-def redraw_route(state, ui: Optional[QtWidgets.QMainWindow] = None) -> None:
-    """
-    Рисует текущий маршрут (ГРАФ) в обеих сценах и обновляет HUD/статус-бар.
-    Ожидает, что routing уже записал в state:
-      - route_pts_px : последовательность точек пути в пикселях PNG (Y вниз),
-      - route_len_m  : длина маршрута в метрах (для HUD, опционально).
-    Также, если заданы robot_px / goal_px — нарисуем маркеры.
-    """
-    route_pts = getattr(state, "route_pts_px", None)
-
-    # 1) Отрисовать линию маршрута
-    for sc, holder in (
-        (getattr(state, "_idle_scene", None),  "idle_route_item"),
-        (getattr(state, "_drive_scene", None), "drive_route_item"),
-    ):
-        if sc is None:
-            continue
-        old = getattr(state, holder, None)
-        new = draw_polyline_path(sc, old, route_pts or [], "#e53935", 3)
-        setattr(state, holder, new)
-
-    # 2) Маркеры робота/цели
-    _draw_robot_and_goal(state)
-
-    # 3) HUD/Status: пишем длину маршрута (если есть) или заглушку
-    if getattr(state, "route_len_m", 0.0) > 0.0:
-        hud_text = f"Маршрут: {state.route_len_m:.1f} м"
-    else:
-        hud_text = "Маршрут не задан"
-
-    for sc in (getattr(state, "_idle_scene", None), getattr(state, "_drive_scene", None)):
-        if sc is not None:
-            update_hud_text(sc, hud_text)
-
-    if ui and hasattr(ui, "statusBar"):
+def _edge_polyline_px(e: Dict[str, Any]) -> List[Point]:
+    poly = e.get(EDGE_POLY_KEY_PX)
+    if isinstance(poly, list) and (not poly or isinstance(poly[0], (list, tuple))):
         try:
-            ui.statusBar().showMessage(hud_text, 3000)
+            return [(float(p[0]), float(p[1])) for p in poly]
         except Exception:
-            pass
+            return []
+    return []
 
+def _edge_polyline_m(e: Dict[str, Any]) -> List[Point]:
+    poly = e.get(EDGE_POLY_KEY_M)
+    if isinstance(poly, list) and (not poly or isinstance(poly[0], (list, tuple))):
+        try:
+            return [(float(p[0]), float(p[1])) for p in poly]
+        except Exception:
+            return []
+    return []
 
-# ======================================================================
-# СОВМЕСТИМОСТЬ: старый хук под IDLE
-# ======================================================================
+# ---------------- загрузка артефактов ----------------
+def load_graph_and_points_for(png_path: str, state) -> bool:
+    base, _ = os.path.splitext(png_path)
+    graph_json  = f"{base}_graph.json"
+    points_json = f"{base}_points_pixels.json"
+    meters_json = f"{base}_points_meters.json"
 
-def redraw_idle_overlays(state, scene: QtWidgets.QGraphicsScene) -> None:
-    """
-    Совместимый «старый» хук для IDLE.
-    Раньше он рисовал по сплайну; теперь всегда работаем с ГРАФОМ:
-      - фиксируем idle-сцену в state (если ещё не сохранена),
-      - вызываем графовую отрисовку маршрута/маркеров.
-    """
-    if getattr(state, "_idle_scene", None) is None and scene is not None:
-        state._idle_scene = scene
-    redraw_route(state)
+    print("[ROUTING] ---- load_graph_and_points_for ----")
+    print("[ROUTING] png:  ", png_path)
+    print("[ROUTING] try graph: ", graph_json,  "  exists=", os.path.isfile(graph_json))
+    print("[ROUTING] try points:", points_json, "  exists=", os.path.isfile(points_json))
+    print("[ROUTING] try meters:", meters_json, "  exists=", os.path.isfile(meters_json))
+
+    if not (os.path.isfile(graph_json) and os.path.isfile(points_json)):
+        print("[ROUTING] graph/points missing")
+        return False
+
+    try:
+        with open(graph_json, "r", encoding="utf-8") as f:
+            graph = json.load(f)
+
+        with open(points_json, "r", encoding="utf-8") as f:
+            pts_raw = json.load(f)
+        if isinstance(pts_raw, dict) and "points" in pts_raw:
+            pts_raw = pts_raw["points"]
+        if not (isinstance(pts_raw, list) and (not pts_raw or isinstance(pts_raw[0], (list, tuple)))):
+            print("[ROUTING] bad points format:", type(pts_raw).__name__)
+            pts = []
+        else:
+            pts = [(float(x), float(y)) for x, y in pts_raw]
+
+        mpp = None
+        if os.path.isfile(meters_json):
+            try:
+                with open(meters_json, "r", encoding="utf-8") as f:
+                    pm = json.load(f)
+                mpp = pm.get("meters_per_pixel")
+            except Exception:
+                pass
+
+        state.graph = graph
+        state.points_px = pts
+        state.meters_per_pixel = float(mpp) if mpp else None
+
+        print(f"[ROUTING] OK: graph={os.path.basename(graph_json)}, points={os.path.basename(points_json)}, mpp={state.meters_per_pixel}")
+        return True
+    except Exception as e:
+        print("[ROUTING] load error:", e)
+        return False
+
+# ---------------- снэп позиций ----------------
+def _nearest_from_list(target: Point, cloud: List[Point]) -> Point:
+    tx, ty = target
+    best, best_d2 = None, float("inf")
+    for (x,y) in cloud:
+        d2=(x-tx)*(x-tx)+(y-ty)*(y-ty)
+        if d2<best_d2:
+            best_d2=d2; best=(x,y)
+    return best if best else target
+
+def set_robot_pose_px(click_px: Point, state) -> Point:
+    pts = getattr(state, "points_px", None) or []
+    snapped = _nearest_from_list(click_px, pts) if pts else (float(click_px[0]), float(click_px[1]))
+    state.robot_px = (float(snapped[0]), float(snapped[1]))
+    print("[ROUTING] robot_px =", state.robot_px)
+    return state.robot_px
+
+def set_goal_px(click_px: Point, state) -> Point:
+    pts = getattr(state, "points_px", None) or []
+    snapped = _nearest_from_list(click_px, pts) if pts else (float(click_px[0]), float(click_px[1]))
+    state.goal_px = (float(snapped[0]), float(snapped[1]))
+    print("[ROUTING] goal_px  =", state.goal_px)
+    return state.goal_px
+
+# ---------------- строитель маршрута (как в interactive_route.py) ----------------
+def build_route_from_robot_to_goal(state) -> bool:
+    start = getattr(state, "robot_px", None)
+    goal  = getattr(state, "goal_px",  None)
+    graph = getattr(state, "graph", None)
+    if not start or not goal or not graph:
+        print("[ROUTING] missing start/goal/graph")
+        return False
+
+    nodes_px = graph.get("nodes", {}).get("px") or []
+    edges    = graph.get("edges", []) or []
+    if not nodes_px or not edges:
+        print("[ROUTING] empty graph")
+        return False
+
+    # смежность реального графа (между узлами u,v; вес = длина poly_px)
+    n = len(nodes_px)
+    adj = [[] for _ in range(n)]  # (v, edge_index, weight_px)
+    for ei, e in enumerate(edges):
+        u = e.get("u"); v = e.get("v")
+        poly_px = _edge_polyline_px(e)
+        if u is None or v is None or len(poly_px) < 2:
+            continue
+        w = sum(_dist(a,b) for a,b in zip(poly_px, poly_px[1:]))
+        adj[u].append((v, ei, w))
+        adj[v].append((u, ei, w))
+
+    # индекс всех вершин всех рёбер → (edge_id, local_idx, xy)
+    all_vertices: List[Tuple[int,int,Point]] = []
+    for ei, e in enumerate(edges):
+        poly_px = _edge_polyline_px(e)
+        for li, (x,y) in enumerate(poly_px):
+            all_vertices.append((ei, li, (x,y)))
+
+    def nearest_edge_vertex(pt: Point):
+        tx, ty = pt
+        best = (float("inf"), -1, -1, (tx,ty))
+        for ei, li, (x,y) in all_vertices:
+            d2 = (x-tx)*(x-tx)+(y-ty)*(y-ty)
+            if d2 < best[0]:
+                best = (d2, ei, li, (x,y))
+        return best  # (d2, ei, li, q)
+
+    # 1) ближайшие вершины рёбер к start/goal
+    _, ei_s, li_s, q_s = nearest_edge_vertex(start)
+    _, ei_g, li_g, q_g = nearest_edge_vertex(goal)
+    if ei_s < 0 or ei_g < 0:
+        print("[ROUTING] no edge near start/goal")
+        return False
+
+    es = edges[ei_s]; eg = edges[ei_g]
+    polyS = _edge_polyline_px(es)
+    polyG = _edge_polyline_px(eg)
+    if not polyS or not polyG:
+        print("[ROUTING] bad edge polylines")
+        return False
+
+    # быстрый кейс: оба клика в одном ребре
+    if ei_s == ei_g:
+        seg_px = _subpoly_idx(polyS, li_s, li_g)
+        seg_m  = _subpoly_idx(_edge_polyline_m(es), li_s, li_g)
+        state.route_pts_px = seg_px
+        if seg_m:
+            state.route_len_m = sum(_dist(a,b) for a,b in zip(seg_m, seg_m[1:]))
+        else:
+            mpp = float(getattr(state, "meters_per_pixel", 0.0) or 0.0)
+            state.route_len_m = sum(_dist(a,b) for a,b in zip(seg_px, seg_px[1:])) * mpp
+        return True
+
+    # 2) строим расширенный граф с 2 «виртуальными» узлами
+    nodes_ext = list(nodes_px)
+    idx_start = len(nodes_ext); nodes_ext.append([q_s[0], q_s[1]])
+    idx_goal  = len(nodes_ext); nodes_ext.append([q_g[0], q_g[1]])
+    adj_ext = [list(row) for row in adj]  # копия
+    adj_ext.extend([[], []])
+
+    def connect_virtual(idx_vrt: int, e_idx: int, l_idx: int):
+        e = edges[e_idx]
+        poly_px = _edge_polyline_px(e)
+        # аккумулированные длины
+        acc = [0.0]
+        for i in range(len(poly_px)-1):
+            acc.append(acc[-1] + _dist(poly_px[i], poly_px[i+1]))
+        segL = acc[-1] if acc else 0.0
+        s_here = acc[l_idx] if l_idx < len(acc) else 0.0
+        u = e.get("u"); v = e.get("v")
+        if u is not None:
+            w = s_here
+            adj_ext[idx_vrt].append((u, -1, w))
+            adj_ext[u].append((idx_vrt, -1, w))
+        if v is not None:
+            w = max(segL - s_here, 0.0)
+            adj_ext[idx_vrt].append((v, -1, w))
+            adj_ext[v].append((idx_vrt, -1, w))
+
+    connect_virtual(idx_start, ei_s, li_s)
+    connect_virtual(idx_goal,  ei_g, li_g)
+
+    # если старт/финиш на изолированных циклах (u=v=None) -> пути нет
+    if (es.get("u") is None and es.get("v") is None) or (eg.get("u") is None and eg.get("v") is None):
+        print("[ROUTING] start/goal on isolated loop")
+        return False
+
+    # 3) Дейкстра
+    N = len(adj_ext)
+    D = [float("inf")]*N
+    P: List[Optional[Tuple[int,int]]] = [None]*N   # (prev_node, edge_index_meta) ; edge_index_meta==-1 для виртуальных связей
+    D[idx_start] = 0.0
+    pq = [(0.0, idx_start)]
+    while pq:
+        d,u = heapq.heappop(pq)
+        if d != D[u]: continue
+        if u == idx_goal: break
+        for v, ei_meta, w in adj_ext[u]:
+            nd = d + w
+            if nd < D[v]:
+                D[v] = nd
+                P[v] = (u, ei_meta)
+                heapq.heappush(pq, (nd, v))
+    if D[idx_goal] == float("inf"):
+        print("[ROUTING] path not found")
+        return False
+
+    # 4) восстановим маршрут (точь-в-точь как в interactive_route.py)
+    # шаги (prev, cur, ei_meta)
+    steps = []
+    cur = idx_goal
+    while cur != idx_start:
+        prev, ei_meta = P[cur]
+        steps.append((prev, cur, ei_meta))
+        cur = prev
+    steps.reverse()
+
+    # быстрое сопоставление ребра по паре узлов
+    edge_by_pair: Dict[Tuple[int,int], int] = {}
+    for ei, e in enumerate(edges):
+        u, v = e.get("u"), e.get("v")
+        if u is not None and v is not None:
+            edge_by_pair[(u, v)] = ei
+            edge_by_pair[(v, u)] = ei
+
+    def edge_between(u, v) -> int:
+        return edge_by_pair.get((u, v), -1)
+
+    pts_px: List[Point] = []
+    length_px = 0.0
+    length_m  = 0.0
+
+    def add_edge_segment(edge_idx: int, i0: int, i1: int):
+        nonlocal pts_px, length_px, length_m
+        e = edges[edge_idx]
+        seg_px = _subpoly_idx(_edge_polyline_px(e), i0, i1)
+        seg_m  = _subpoly_idx(_edge_polyline_m(e),  i0, i1) if _edge_polyline_m(e) else []
+        if pts_px and seg_px:
+            if pts_px[-1] == seg_px[0]:
+                pts_px.extend(seg_px[1:])
+            else:
+                pts_px.extend(seg_px)
+        else:
+            pts_px.extend(seg_px)
+        length_px += sum(_dist(a,b) for a,b in zip(seg_px, seg_px[1:]))
+        if seg_m:
+            length_m  += sum(_dist(a,b) for a,b in zip(seg_m, seg_m[1:]))
+
+    # нужен также индекс вершин внутри стартового/финишного ребра
+    for (a, b, ei_meta) in steps:
+        if ei_meta == -1:
+            # виртуальная связь: добавляем половину своего ребра
+            if a == idx_start or b == idx_start:
+                e = edges[ei_s]
+                if a == idx_start:
+                    if e.get("u") == (b if b < len(nodes_px) else -1):
+                        add_edge_segment(ei_s, li_s, 0)
+                    elif e.get("v") == (b if b < len(nodes_px) else -1):
+                        add_edge_segment(ei_s, li_s, len(_edge_polyline_px(e)) - 1)
+                else:
+                    if e.get("u") == (a if a < len(nodes_px) else -1):
+                        add_edge_segment(ei_s, 0, li_s)
+                    elif e.get("v") == (a if a < len(nodes_px) else -1):
+                        add_edge_segment(ei_s, len(_edge_polyline_px(e)) - 1, li_s)
+
+            elif a == idx_goal or b == idx_goal:
+                e = edges[ei_g]
+                if a == idx_goal:
+                    if e.get("u") == (b if b < len(nodes_px) else -1):
+                        add_edge_segment(ei_g, li_g, 0)
+                    elif e.get("v") == (b if b < len(nodes_px) else -1):
+                        add_edge_segment(ei_g, li_g, len(_edge_polyline_px(e)) - 1)
+                else:
+                    if e.get("u") == (a if a < len(nodes_px) else -1):
+                        add_edge_segment(ei_g, 0, li_g)
+                    elif e.get("v") == (a if a < len(nodes_px) else -1):
+                        add_edge_segment(ei_g, len(_edge_polyline_px(e)) - 1, li_g)
+            else:
+                # виртуал между реальными узлами — геометрию добавит следующий шаг
+                pass
+        else:
+            # нормальное ребро между двумя реальными узлами
+            ei = ei_meta if ei_meta >= 0 else edge_between(a, b)
+            if ei >= 0:
+                e = edges[ei]
+                if e.get("u") == a and e.get("v") == b:
+                    add_edge_segment(ei, 0, len(_edge_polyline_px(e)) - 1)
+                elif e.get("u") == b and e.get("v") == a:
+                    add_edge_segment(ei, len(_edge_polyline_px(e)) - 1, 0)
+
+    state.route_pts_px = pts_px
+    if length_m > 0.0:
+        state.route_len_m = float(length_m)
+    else:
+        mpp = float(getattr(state, "meters_per_pixel", 0.0) or 0.0)
+        state.route_len_m = sum(_dist(a,b) for a,b in zip(pts_px, pts_px[1:])) * mpp
+    return True
+
+# ---------------- совместимость и помощники ----------------
+def build_route_snap_pixels(start_px: Point, goal_px: Point, state) -> bool:
+    set_robot_pose_px(start_px, state)
+    set_goal_px(goal_px, state)
+    return build_route_from_robot_to_goal(state)
+
+def route_caption_text(state) -> str:
+    L = float(getattr(state, "route_len_m", 0.0) or 0.0)
+    done = float(getattr(state, "route_done_m", 0.0) or 0.0)
+    left = max(0.0, L - done)
+    return f"Маршрут: {L:.1f} м | Пройдено: {done:.1f} м | Осталось: {left:.1f} м"
+
+# для старых вызовов
+def update_progress_text_for_robot(*args, **kwargs) -> str:
+    state = args[-1] if args else kwargs.get("state")
+    return route_caption_text(state)
+
+# Перерисовать маркеры и маршрут (используйте в Main.to_idle()/to_drive())
+def refresh_all_overlays(state, idle_view, drive_view):
+    from graphics import redraw_markers, redraw_route
+    for view in (idle_view, drive_view):
+        if view and view.scene():
+            redraw_markers(state, view.scene())
+    # маршрут в обеих сценах
+    if hasattr(state, "route_pts_px") and state.route_pts_px:
+        redraw_route(state, None)

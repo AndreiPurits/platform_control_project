@@ -6,8 +6,16 @@ from PyQt5 import QtWidgets
 class AppState:
     def __init__(self):
         # Карта
-        self.active_map_path: Optional[str] = None
+        self.active_map_path = None
+        self.graph = None
+        self.points_px = None
+        self.meters_per_pixel = None
 
+        self.robot_px = None
+        self.goal_px  = None
+        self.route_pts_px = []
+        self.route_len_m  = 0.0
+        self.route_done_m = 0.0
         # Сплайн карты (в пикселях)
         self.spline_polyline: Optional[List[Tuple[float, float]]] = None
 

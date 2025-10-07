@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import math
+import math, time
 from typing import Iterable, Optional, Sequence, Tuple
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -12,13 +12,13 @@ class RadarHeatmap(QtCore.QObject):
     def __init__(self,
                  view: QtWidgets.QGraphicsView,
                  meters_span: float = 12.0,
-                 rotation_deg: float = 90.0,
+                 rotation_deg: float = 0.0,
                  decay: float = 0.92,
                  dot_radius_px: int = 2):
         super().__init__(view)
         self.view = view
         self.meters_span = float(meters_span)
-        self.rotation_deg = float(rotation_deg)
+        self.rotation_deg = float(0)
         self.decay = float(decay)
         self.dot_r = int(dot_radius_px)
 
@@ -38,14 +38,17 @@ class RadarHeatmap(QtCore.QObject):
         self._ppm = 1.0
         self._cx = 0.0
         self._cy = 0.0
-        self._rot_rad = math.radians(self.rotation_deg)
+        self._rot_rad = math.radians(0)
 
         self._heat_qimg: Optional[QtGui.QImage] = None
         self._heat_pm_item: Optional[QtWidgets.QGraphicsPixmapItem] = None
         self._grid_group: Optional[QtWidgets.QGraphicsItemGroup] = None
         self._robot_item: Optional[QtWidgets.QGraphicsItemGroup] = None
         self._robot_pixmap_item: Optional[QtWidgets.QGraphicsPixmapItem] = None
-
+        self._trail_img: Optional[QtGui.QImage] = None
+        self._trail_item: Optional[QtWidgets.QGraphicsPixmapItem] = None
+        self._last_ts = time.perf_counter()
+        self.half_life_s = 0.3  # полужизнь шлейфа, сек (можешь поменять)
         # реагируем на ресайз
         self._rf = _ResizeFilter(self._on_resized)
         view.viewport().installEventFilter(self._rf)
@@ -64,50 +67,103 @@ class RadarHeatmap(QtCore.QObject):
         item = self.scene.addPixmap(pm)
         item.setOffset(-pm.width()/2.0, -pm.height()/2.0)
         item.setPos(self._cx, self._cy)
-        item.setRotation(-self.rotation_deg)  # «нос» вперёд
+        item.setRotation(0)  # «нос» вперёд
         self._robot_pixmap_item = item
 
     def update_from_xy(self, points_xy_m: Sequence[Tuple[float, float]]):
-        """
-        Принимает точки лидара в метрах в системе (x вправо, y вверх).
-        Рисует точки на heatmap с затуханием прошлых кадров.
-        """
-        if not points_xy_m:
-            return
-        if self._heat_qimg is None:
+        # гарантируем, что есть куда рисовать
+        self._ensure_canvas()
+        if self._trail_img is None or self._trail_img.isNull():
             return
 
-        # затухание предыдущего кадра
-        self._fade()
+        TRAIL_COLOR = QtGui.QColor(255, 80, 0, 200)
 
-        p = QtGui.QPainter(self._heat_qimg)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(255, 80, 0, 200))
+        # --- 1) время с последнего кадра ---
+        now = time.perf_counter()
+        dt = max(0.0, now - self._last_ts)
+        self._last_ts = now
 
-        half = self.meters_span * 0.5
-        cosr, sinr = math.cos(self._rot_rad), math.sin(self._rot_rad)
+        # коэффициент затухания (half-life)
+        if self.half_life_s > 0:
+            alpha_scale = 0.5 ** (dt / self.half_life_s)
+        else:
+            alpha_scale = 0.0  # мгновенное исчезновение
 
-        for x_m, y_m in points_xy_m:
-            # повернём на rotation_deg (по часовой)
-            xr = x_m * cosr - y_m * sinr
-            yr = x_m * sinr + y_m * cosr
+        # --- 2) затухание существующего шлейфа ---
+        fade = QtGui.QPainter(self._trail_img)
+        fade.setCompositionMode(QtGui.QPainter.CompositionMode_DestinationIn)
+        fade.fillRect(self._trail_img.rect(),
+                    QtGui.QColor(0, 0, 0, int(255 * alpha_scale)))
+        fade.end()
 
-            if not (-half <= xr <= half and -half <= yr <= half):
-                continue
+        # --- 3) рисуем новые красные точки поверх ---
+        if points_xy_m:
+            p = QtGui.QPainter(self._trail_img)
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(TRAIL_COLOR)
+            p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
 
-            x_px = self._cx + xr * self._ppm
-            y_px = self._cy - yr * self._ppm  # y вверх -> экран вниз
+            # границы видимой области (метры)
+            vp = self.view.viewport().rect()
+            half_x = self.meters_span * 0.5
+            span_y_m = self.meters_span * (vp.height() / max(1, vp.width()))
+            half_y = span_y_m * 0.5
 
-            p.drawEllipse(QtCore.QPointF(x_px, y_px), self.dot_r, self.dot_r)
+            # поворот: rotation_deg трактуем как "по часовой" => мат. угол отрицательный
+            cosr = math.cos(-math.radians(self.rotation_deg))
+            sinr = math.sin(-math.radians(self.rotation_deg))
 
-        p.end()
-        if self._heat_pm_item:
-            self._heat_pm_item.setPixmap(QtGui.QPixmap.fromImage(self._heat_qimg))
+            for x_m, y_m in points_xy_m:
+                xr = x_m * cosr - y_m * sinr
+                yr = x_m * sinr + y_m * cosr
+
+                if xr < -half_x or xr > half_x or yr < -half_y or yr > half_y:
+                    continue
+
+                x_px = self._cx + xr * self._ppm
+                y_px = self._cy - yr * self._ppm  # метрический y вверх -> экран вниз
+
+                p.drawEllipse(QtCore.QPointF(x_px, y_px), self.dot_r, self.dot_r)
+
+            p.end()
+
+        # --- 4) обновить item на сцене (исправлено: setPixmap) ---
+        if self._trail_item:
+            self._trail_item.setPixmap(QtGui.QPixmap.fromImage(self._trail_img))
 
     # внутреннее
     def _on_resized(self):
         self._recreate_canvas()
+        
+    def _ensure_canvas(self):
+        """Создаёт холст шлейфа, если его ещё нет (например, до первого resize/show)."""
+        if self._trail_img is None or self._trail_img.isNull():
+            # берём квадрат по минимальной стороне viewport'а (как у тебя)
+            vp = self.view.viewport().rect()
+            s = max(200, min(vp.width(), vp.height()))
+            if s <= 0:
+                return
+            # пересчёт метрик
+            self._ppm = s / max(1e-6, self.meters_span)
+
+            # центр viewport'а в координатах сцены
+            center_scene = self.view.mapToScene(vp.center())
+            self._cx, self._cy = center_scene.x(), center_scene.y()
+
+            # создаём холст
+            self._trail_img = QtGui.QImage(s, s, QtGui.QImage.Format_ARGB32_Premultiplied)
+            self._trail_img.fill(QtCore.Qt.transparent)
+
+            # позиция — так, чтобы холст оказался по центру viewport'а
+            top_left_scene = self.view.mapToScene(vp.center() - QtCore.QPoint(s // 2, s // 2))
+            if self._trail_item is None:
+                self._trail_item = self.scene.addPixmap(QtGui.QPixmap.fromImage(self._trail_img))
+            else:
+                self._trail_item.setPixmap(QtGui.QPixmap.fromImage(self._trail_img))
+            self._trail_item.setPos(top_left_scene)
+
+            self._last_ts = time.perf_counter()
 
     def _recreate_canvas(self):
         vp = self.view.viewport().rect()
@@ -139,7 +195,7 @@ class RadarHeatmap(QtCore.QObject):
 
         if self._robot_pixmap_item:
             self._robot_pixmap_item.setPos(self._cx, self._cy)
-            self._robot_pixmap_item.setRotation(-self.rotation_deg)
+            self._robot_pixmap_item.setRotation(0)
         else:
             if self._robot_item:
                 self.scene.removeItem(self._robot_item)
@@ -150,13 +206,6 @@ class RadarHeatmap(QtCore.QObject):
     def _fit(self):
         self.view.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
 
-    def _fade(self):
-        f = QtGui.QImage(self._heat_qimg.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
-        f.fill(QtGui.QColor(0, 0, 0, int(255 * max(0.0, min(1.0, self.decay)))))
-        p = QtGui.QPainter(self._heat_qimg)
-        p.setCompositionMode(QtGui.QPainter.CompositionMode_DestinationIn)
-        p.drawImage(0, 0, f)
-        p.end()
 
     def _draw_grid(self):
         items = []
@@ -199,7 +248,7 @@ class RadarHeatmap(QtCore.QObject):
         ])
         item = self.scene.addPolygon(poly, pen, brush)
         item.setPos(self._cx, self._cy)
-        item.setRotation(-self.rotation_deg)
+        item.setRotation(0)
         item.setZValue(20)
         self._robot_item = item
 

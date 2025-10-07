@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- widgets.py
 from PyQt5.QtCore import Qt, QObject, QEvent
 
 class MapClickFilter(QObject):

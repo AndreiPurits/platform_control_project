@@ -1,13 +1,19 @@
-# -*- coding: utf-8 -*-
-import os, sys
+# -*- coding: utf-8 -*- main_runtime.py
+import os
 from PyQt5 import QtWidgets, QtCore, QtGui, uic
 import signal
 from state import AppState
 from page_idle import IdlePage
 from page_drive import DrivePage
 from page_maps import MapsPage
-from graphics import refresh_all_overlays
-
+from routing import refresh_all_overlays
+import logging, sys
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+print("[BOOT] logging ready", flush=True)
 UI_PATH = os.path.join(os.path.dirname(__file__), "main_window.ui")
 
 class Main(QtWidgets.QMainWindow):
@@ -81,7 +87,7 @@ class Main(QtWidgets.QMainWindow):
         self.stack.setCurrentWidget(self.pageMaps)
         if self.statusBar():
             self.statusBar().showMessage("Выберите PNG в каталоге карт, рядом .json — опционально", 3000)
-
+     
     # ----------- верхний бар DRIVE -----------
     def _on_startstop_toggled(self, checked: bool):
         self.state.is_running = bool(checked)
