@@ -3,48 +3,33 @@
  <class>MainWindow</class>
  <widget class="QMainWindow" name="MainWindow">
   <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>1280</width>
-    <height>800</height>
-   </rect>
+   <rect><x>0</x><y>0</y><width>1280</width><height>800</height></rect>
   </property>
-  <property name="windowTitle">
-   <string>Platform GUI</string>
-  </property>
+  <property name="windowTitle"><string>Platform GUI</string></property>
+
   <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="centralLayout">
-    <property name="spacing">
-     <number>12</number>
-    </property>
+    <property name="spacing"><number>12</number></property>
+
     <item>
      <widget class="QStackedWidget" name="stackRoot">
-      <property name="currentIndex">
-       <number>2</number>
-      </property>
+      <property name="currentIndex"><number>0</number></property>
+
+      <!-- ===================== IDLE ===================== -->
       <widget class="QWidget" name="pageIdle">
        <layout class="QVBoxLayout" name="idleLayout">
-        <property name="spacing">
-         <number>12</number>
-        </property>
+        <property name="spacing"><number>12</number></property>
+
         <item>
          <widget class="QLabel" name="lblIdleMapTitle">
           <property name="font">
-           <font>
-            <pointsize>18</pointsize>
-            <weight>75</weight>
-            <bold>true</bold>
-           </font>
+           <font><pointsize>18</pointsize><weight>75</weight><bold>true</bold></font>
           </property>
-          <property name="text">
-           <string>Карта</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
-          </property>
+          <property name="text"><string>Карта</string></property>
+          <property name="alignment"><set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set></property>
          </widget>
         </item>
+
         <item>
          <widget class="QGraphicsView" name="mapViewIdle">
           <property name="sizePolicy">
@@ -53,22 +38,17 @@
             <verstretch>0</verstretch>
            </sizepolicy>
           </property>
-          <property name="minimumSize">
-           <size>
-            <width>800</width>
-            <height>450</height>
-           </size>
-          </property>
+          <property name="minimumSize"><size><width>800</width><height>450</height></size></property>
           <property name="styleSheet">
            <string notr="true">background:#f5f5f5; border:1px solid #dcdcdc;</string>
           </property>
          </widget>
         </item>
+
         <item>
          <layout class="QHBoxLayout" name="idleButtonsLayout">
-          <property name="spacing">
-           <number>12</number>
-          </property>
+          <property name="spacing"><number>12</number></property>
+
           <item>
            <widget class="QPushButton" name="btnChooseMap">
             <property name="sizePolicy">
@@ -77,28 +57,16 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
-            <property name="minimumSize">
-             <size>
-              <width>200</width>
-              <height>60</height>
-             </size>
-            </property>
-            <property name="font">
-             <font>
-              <pointsize>16</pointsize>
-             </font>
-            </property>
-            <property name="toolTip">
-             <string>Открыть экран выбора карты</string>
-            </property>
+            <property name="minimumSize"><size><width>200</width><height>60</height></size></property>
+            <property name="font"><font><pointsize>16</pointsize></font></property>
+            <property name="toolTip"><string>Открыть PNG-карту (диалог выбора файла)</string></property>
             <property name="styleSheet">
              <string notr="true">background:#eaeaea; border:1px solid #cfcfcf; border-radius:8px; padding:10px 16px;</string>
             </property>
-            <property name="text">
-             <string>Выбор карты</string>
-            </property>
+            <property name="text"><string>Выбор карты</string></property>
            </widget>
           </item>
+
           <item>
            <widget class="QPushButton" name="btnLocalization">
             <property name="sizePolicy">
@@ -107,20 +75,13 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
-            <property name="minimumSize">
-             <size>
-              <width>160</width>
-              <height>60</height>
-             </size>
-            </property>
-            <property name="toolTip">
-             <string>Автолокализация (заглушка)</string>
-            </property>
-            <property name="text">
-             <string>Локализация</string>
-            </property>
+            <property name="minimumSize"><size><width>160</width><height>60</height></size></property>
+            <property name="toolTip"><string>Режим добавления синих контрольных точек</string></property>
+            <property name="text"><string>Контрольная точка</string></property>
+            <property name="checkable"><bool>true</bool></property>
            </widget>
           </item>
+
           <item>
            <widget class="QPushButton" name="btnManualLocalization">
             <property name="sizePolicy">
@@ -129,55 +90,35 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
-            <property name="minimumSize">
-             <size>
-              <width>220</width>
-              <height>60</height>
-             </size>
-            </property>
-            <property name="toolTip">
-             <string>Включить режим: клик на карте = задать позу робота</string>
-            </property>
-            <property name="text">
-             <string>Локализация вручную</string>
-            </property>
-            <property name="checkable">
-             <bool>true</bool>
-            </property>
+            <property name="minimumSize"><size><width>220</width><height>60</height></size></property>
+            <property name="toolTip"><string>Включить режим: клик на карте = задать позу робота</string></property>
+            <property name="text"><string>Локализация вручную</string></property>
+            <property name="checkable"><bool>true</bool></property>
            </widget>
           </item>
+
           <item>
            <widget class="QPushButton" name="btnSelectGoalIdle">
-            <property name="minimumSize">
-             <size>
-              <width>180</width>
-              <height>60</height>
-             </size>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="toolTip">
-             <string>Клик на карте = выбрать контрольную точку (к ближайшему узлу сплайна)</string>
-            </property>
-            <property name="text">
-             <string>Выбрать цель</string>
-            </property>
-            <property name="checkable">
-             <bool>true</bool>
-            </property>
+            <property name="minimumSize"><size><width>180</width><height>60</height></size></property>
+            <property name="toolTip"><string>Клик на карте = выбрать цель маршрута</string></property>
+            <property name="text"><string>Выбрать цель</string></property>
+            <property name="checkable"><bool>true</bool></property>
            </widget>
           </item>
+
           <item>
            <spacer name="idleButtonsSpacer">
-            <property name="orientation">
-             <enum>Qt::Horizontal</enum>
-            </property>
-            <property name="sizeHint" stdset="0">
-             <size>
-              <width>40</width>
-              <height>20</height>
-             </size>
-            </property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+            <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
            </spacer>
           </item>
+
           <item>
            <widget class="QPushButton" name="btnStart">
             <property name="sizePolicy">
@@ -186,202 +127,207 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
-            <property name="minimumSize">
-             <size>
-              <width>220</width>
-              <height>70</height>
-             </size>
-            </property>
+            <property name="minimumSize"><size><width>220</width><height>70</height></size></property>
             <property name="font">
-             <font>
-              <pointsize>18</pointsize>
-              <weight>75</weight>
-              <bold>true</bold>
-             </font>
+             <font><pointsize>18</pointsize><weight>75</weight><bold>true</bold></font>
             </property>
-            <property name="toolTip">
-             <string>Запуск миссии</string>
-            </property>
+            <property name="toolTip"><string>Запуск миссии</string></property>
             <property name="styleSheet">
              <string notr="true">background:#2d6; color:white; border-radius:10px; padding:12px 20px;</string>
             </property>
-            <property name="text">
-             <string>Пуск</string>
-            </property>
+            <property name="text"><string>Пуск</string></property>
            </widget>
           </item>
+
          </layout>
         </item>
        </layout>
       </widget>
+
+      <!-- ===================== DRIVE ===================== -->
       <widget class="QWidget" name="pageDrive">
        <layout class="QVBoxLayout" name="driveRootLayout">
-        <property name="spacing">
-         <number>12</number>
-        </property>
+        <property name="spacing"><number>12</number></property>
+
         <item>
          <layout class="QHBoxLayout" name="driveTopBarLayout">
-          <property name="spacing">
-           <number>12</number>
-          </property>
+          <property name="spacing"><number>12</number></property>
+
           <item>
            <widget class="QPushButton" name="btnStartStop">
-            <property name="minimumSize">
-             <size>
-              <width>180</width>
-              <height>56</height>
-             </size>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
+            <property name="minimumSize"><size><width>180</width><height>56</height></size></property>
             <property name="styleSheet">
              <string notr="true">background:#2d6; color:white; border-radius:10px; padding:10px 18px;</string>
             </property>
-            <property name="text">
-             <string>Пуск</string>
-            </property>
-            <property name="checkable">
-             <bool>true</bool>
-            </property>
+            <property name="text"><string>Пуск</string></property>
+            <property name="checkable"><bool>true</bool></property>
            </widget>
           </item>
+
           <item>
            <widget class="QLabel" name="lblSpeed">
-            <property name="font">
-             <font>
-              <pointsize>13</pointsize>
-             </font>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="text">
-             <string>Скорость: — м/с</string>
-            </property>
+            <property name="font"><font><pointsize>13</pointsize></font></property>
+            <property name="text"><string>Скорость: — м/с</string></property>
            </widget>
           </item>
+
           <item>
            <widget class="QLabel" name="lblMinDist">
-            <property name="font">
-             <font>
-              <pointsize>13</pointsize>
-             </font>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="text">
-             <string>Мин. дистанция: — м</string>
-            </property>
+            <property name="font"><font><pointsize>13</pointsize></font></property>
+            <property name="text"><string>Маршрут: —</string></property>
            </widget>
           </item>
+
           <item>
            <widget class="QLabel" name="lblGuardState">
-            <property name="font">
-             <font>
-              <pointsize>13</pointsize>
-             </font>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="text">
-             <string>Состояние: —</string>
-            </property>
+            <property name="font"><font><pointsize>13</pointsize></font></property>
+            <property name="text"><string>Состояние: —</string></property>
            </widget>
           </item>
+
           <item>
            <widget class="QLabel" name="lblSafetyStop">
-            <property name="font">
-             <font>
-              <pointsize>13</pointsize>
-             </font>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="text">
-             <string>STOP: —</string>
-            </property>
+            <property name="font"><font><pointsize>13</pointsize></font></property>
+            <property name="text"><string>STOP: —</string></property>
            </widget>
           </item>
+
           <item>
            <spacer name="driveTopSpacer">
-            <property name="orientation">
-             <enum>Qt::Horizontal</enum>
-            </property>
-            <property name="sizeHint" stdset="0">
-             <size>
-              <width>40</width>
-              <height>20</height>
-             </size>
-            </property>
+            <property name="orientation"><enum>Qt::Horizontal</enum></property>
+            <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
            </spacer>
           </item>
+
+          <!-- НОВАЯ КНОПКА: РОВЕР -->
           <item>
-           <widget class="QPushButton" name="btnSelectGoalDrive">
-            <property name="minimumSize">
-             <size>
-              <width>120</width>
-              <height>50</height>
-             </size>
+           <widget class="QPushButton" name="btnRobotDrive">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
-            <property name="text">
-             <string>Цель</string>
-            </property>
-            <property name="checkable">
-             <bool>true</bool>
-            </property>
+            <property name="minimumSize"><size><width>120</width><height>50</height></size></property>
+            <property name="toolTip"><string>Режим: клик на карте = задать позу робота</string></property>
+            <property name="text"><string>Ровер</string></property>
+            <property name="checkable"><bool>true</bool></property>
            </widget>
           </item>
+
+          <item>
+           <widget class="QPushButton" name="btnSelectGoalDrive">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize"><size><width>120</width><height>50</height></size></property>
+            <property name="text"><string>Цель</string></property>
+            <property name="checkable"><bool>true</bool></property>
+           </widget>
+          </item>
+
+          <item>
+           <widget class="QPushButton" name="btnKR">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize"><size><width>120</width><height>50</height></size></property>
+            <property name="toolTip"><string>Режим: ставить синие контрольные точки</string></property>
+            <property name="text"><string>КР</string></property>
+            <property name="checkable"><bool>true</bool></property>
+           </widget>
+          </item>
+
           <item>
            <widget class="QPushButton" name="btnMapPicker">
-            <property name="minimumSize">
-             <size>
-              <width>140</width>
-              <height>50</height>
-             </size>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
+            <property name="minimumSize"><size><width>140</width><height>50</height></size></property>
             <property name="styleSheet">
              <string notr="true">background:#eaeaea; border:1px solid #cfcfcf; border-radius:8px;</string>
             </property>
-            <property name="text">
-             <string>Карты</string>
-            </property>
+            <property name="text"><string>Карты</string></property>
            </widget>
           </item>
+
           <item>
            <widget class="QPushButton" name="btnEStop">
-            <property name="minimumSize">
-             <size>
-              <width>140</width>
-              <height>56</height>
-             </size>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
             </property>
+            <property name="minimumSize"><size><width>140</width><height>56</height></size></property>
             <property name="styleSheet">
              <string notr="true">background:#d64545; color:white; border-radius:10px; font-weight:bold; padding:10px 18px;</string>
             </property>
-            <property name="text">
-             <string>E-STOP</string>
-            </property>
+            <property name="text"><string>E-STOP</string></property>
            </widget>
           </item>
+
          </layout>
         </item>
+
         <item>
          <widget class="QSplitter" name="driveSplitter">
-          <property name="orientation">
-           <enum>Qt::Horizontal</enum>
-          </property>
-          <property name="opaqueResize">
-           <bool>true</bool>
-          </property>
-          <property name="handleWidth">
-           <number>6</number>
-          </property>
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+          <property name="opaqueResize"><bool>true</bool></property>
+          <property name="handleWidth"><number>6</number></property>
+
           <widget class="QWidget" name="driveLeftPanel">
            <layout class="QVBoxLayout" name="driveLeftLayout">
-            <property name="spacing">
-             <number>8</number>
-            </property>
+            <property name="spacing"><number>8</number></property>
             <item>
              <widget class="QLabel" name="lblDriveMapTitle">
-              <property name="font">
-               <font>
-                <pointsize>16</pointsize>
-                <weight>75</weight>
-                <bold>true</bold>
-               </font>
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
               </property>
-              <property name="text">
-               <string>Карта</string>
-              </property>
+              <property name="font"><font><pointsize>16</pointsize><weight>75</weight><bold>true</bold></font></property>
+              <property name="text"><string>Карта</string></property>
              </widget>
             </item>
             <item>
@@ -392,12 +338,7 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="minimumSize">
-               <size>
-                <width>600</width>
-                <height>450</height>
-               </size>
-              </property>
+              <property name="minimumSize"><size><width>600</width><height>450</height></size></property>
               <property name="styleSheet">
                <string notr="true">background:#f5f5f5; border:1px solid #dcdcdc;</string>
               </property>
@@ -405,23 +346,20 @@
             </item>
            </layout>
           </widget>
+
           <widget class="QWidget" name="driveRightPanel">
            <layout class="QVBoxLayout" name="driveRightLayout">
-            <property name="spacing">
-             <number>8</number>
-            </property>
+            <property name="spacing"><number>8</number></property>
             <item>
              <widget class="QLabel" name="lblDriveRadarTitle">
-              <property name="font">
-               <font>
-                <pointsize>16</pointsize>
-                <weight>75</weight>
-                <bold>true</bold>
-               </font>
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                <horstretch>0</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
               </property>
-              <property name="text">
-               <string>Радар</string>
-              </property>
+              <property name="font"><font><pointsize>16</pointsize><weight>75</weight><bold>true</bold></font></property>
+              <property name="text"><string>Радар</string></property>
              </widget>
             </item>
             <item>
@@ -432,12 +370,7 @@
                 <verstretch>0</verstretch>
                </sizepolicy>
               </property>
-              <property name="minimumSize">
-               <size>
-                <width>600</width>
-                <height>450</height>
-               </size>
-              </property>
+              <property name="minimumSize"><size><width>600</width><height>450</height></size></property>
               <property name="styleSheet">
                <string notr="true">background:#f5f5f5; border:1px solid #dcdcdc;</string>
               </property>
@@ -445,94 +378,17 @@
             </item>
            </layout>
           </widget>
+
          </widget>
         </item>
        </layout>
       </widget>
-      <widget class="QWidget" name="pageMaps">
-       <layout class="QVBoxLayout" name="mapsLayout">
-        <property name="spacing">
-         <number>12</number>
-        </property>
-        <item>
-         <layout class="QHBoxLayout" name="mapsToolbarLayout">
-          <property name="spacing">
-           <number>12</number>
-          </property>
-          <item>
-           <widget class="QLabel" name="lblMapsTitle">
-            <property name="font">
-             <font>
-              <pointsize>18</pointsize>
-              <weight>75</weight>
-              <bold>true</bold>
-             </font>
-            </property>
-            <property name="text">
-             <string>Выбор карты</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <spacer name="mapsToolbarSpacer">
-            <property name="orientation">
-             <enum>Qt::Horizontal</enum>
-            </property>
-            <property name="sizeHint" stdset="0">
-             <size>
-              <width>40</width>
-              <height>20</height>
-             </size>
-            </property>
-           </spacer>
-          </item>
-          <item>
-           <widget class="QPushButton" name="btnChooseFromFolder">
-            <property name="minimumSize">
-             <size>
-              <width>180</width>
-              <height>50</height>
-             </size>
-            </property>
-            <property name="toolTip">
-             <string>Открыть PNG из ~/Downloads/maps_repo</string>
-            </property>
-            <property name="text">
-             <string>Выбрать карту…</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QPushButton" name="btnMapsBack">
-            <property name="minimumSize">
-             <size>
-              <width>140</width>
-              <height>50</height>
-             </size>
-            </property>
-            <property name="text">
-             <string>Назад</string>
-            </property>
-           </widget>
-          </item>
-         </layout>
-        </item>
-        <item>
-         <widget class="QLabel" name="lblMapsHint">
-          <property name="text">
-           <string>Папка: ~/Downloads/maps_repo. Нажмите «Выбрать карту…». Если рядом есть файл .json — сплайн загрузится автоматически.</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignTop</set>
-          </property>
-         </widget>
-        </item>
-       </layout>
-      </widget>
+
      </widget>
     </item>
    </layout>
   </widget>
+
   <widget class="QStatusBar" name="statusbar"/>
  </widget>
  <resources/>

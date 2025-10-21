@@ -56,30 +56,34 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
     graph_json  = f"{base}_graph.json"
     points_json = f"{base}_points_pixels.json"
 
-    print("[ROUTING] ---- load_graph_and_points_for ----")
-    print("[ROUTING] png:", png_path)
-    print("[ROUTING] graph exists:", os.path.isfile(graph_json))
-    print("[ROUTING] points exists:", os.path.isfile(points_json))
+    print("[ROUTING] ---- load_graph_and_points_for ----", flush=True)
+    print("[ROUTING] png:   ", png_path, flush=True)
+    print("[ROUTING] graph: ", graph_json,  "  exists=", os.path.isfile(graph_json), flush=True)
+    print("[ROUTING] points:", points_json, "  exists=", os.path.isfile(points_json), flush=True)
 
     if not (os.path.isfile(graph_json) and os.path.isfile(points_json)):
-        print("[ROUTING] missing graph/points files")
+        print("[ROUTING] graph/points missing", flush=True)
         return False
 
     try:
-        # --- загрузка графа и точек ---
         with open(graph_json, "r", encoding="utf-8") as f:
             graph = json.load(f)
+
         with open(points_json, "r", encoding="utf-8") as f:
             pts_raw = json.load(f)
-
         if isinstance(pts_raw, dict) and "points" in pts_raw:
             pts_raw = pts_raw["points"]
-        pts = [(float(x), float(y)) for x, y in pts_raw] if isinstance(pts_raw, list) else []
+        if not (isinstance(pts_raw, list) and (not pts_raw or isinstance(pts_raw[0], (list, tuple)))):
+            print("[ROUTING] bad points format:", type(pts_raw).__name__, flush=True)
+            pts = []
+        else:
+            pts = [(float(x), float(y)) for x, y in pts_raw]
 
+        # сохранить в состояние
         state.graph = graph
         state.points_px = pts
 
-        # --- масштаб только для известных карт ---
+        # Установить анизотропный масштаб по имени карты
         name = os.path.basename(png_path).lower()
         if "poly_asf" in name:
             state.m_per_px_x = 0.8342405111938622
@@ -87,27 +91,15 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
         elif "poly_grd" in name:
             state.m_per_px_x = 1.670743420684952
             state.m_per_px_y = 1.4202174529355311
+        else:
+            # Если вдруг другая карта — хотя бы не нули (можно подменить своими)
+            state.m_per_px_x = 1.0
+            state.m_per_px_y = 1.0
 
-        # --- развилки (junctions_px) ---
-        try:
-            nodes_px = graph.get("nodes", {}).get("px") or []
-            edges = graph.get("edges", []) or []
-            deg = [0]*len(nodes_px)
-            for e in edges:
-                u = e.get("u"); v = e.get("v")
-                if isinstance(u, int) and isinstance(v, int) and 0 <= u < len(nodes_px) and 0 <= v < len(nodes_px):
-                    deg[u] += 1
-                    deg[v] += 1
-            state.junctions_px = [tuple(map(float, nodes_px[i])) for i, d in enumerate(deg) if d >= 3]
-            print(f"[ROUTING] junctions_px saved ({len(state.junctions_px)})", flush=True)
-        except Exception as ex:
-            state.junctions_px = []
-            print("[ROUTING] junctions_px calc error:", ex, flush=True)
-
+        print(f"[ROUTING] scale: m_per_px_x={state.m_per_px_x}  m_per_px_y={state.m_per_px_y}", flush=True)
         return True
-
     except Exception as e:
-        print("[ROUTING] load error:", e)
+        print("[ROUTING] load error:", e, flush=True)
         return False
 
 # ---------------- снэп позиций ----------------

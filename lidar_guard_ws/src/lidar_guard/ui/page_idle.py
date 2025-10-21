@@ -3,8 +3,8 @@
 from typing import Tuple, Optional
 from PyQt5 import QtWidgets, QtCore, QtGui
 from state import AppState
-from graphics import ensure_scene, prepare_view, redraw_markers, redraw_route
-from routing import set_robot_pose_px, set_goal_px, build_route_from_robot_to_goal
+from graphics import ensure_scene, prepare_view, redraw_markers, redraw_route, reset_route_progress
+from routing import set_robot_pose_px, set_goal_px, build_route_from_robot_to_goal, set_control_item_px
 from robot_cmd import update_drive_panel   # для lblMinDist
 
 Point = Tuple[float, float]
@@ -23,8 +23,8 @@ class IdlePage(QtCore.QObject):
         self.btnStart: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnStart")
         self.btnSelectGoalIdle: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnSelectGoalIdle")
 
-        if self.btnChooseMap: self.btnChooseMap.clicked.connect(self._go_maps)
-        if self.btnStart:      self.btnStart.clicked.connect(self._go_drive)
+        if self.btnStart:      
+            self.btnStart.clicked.connect(self._go_drive)
 
         ensure_scene(self.mapViewIdle); 
         try: prepare_view(self.mapViewIdle)
@@ -33,7 +33,8 @@ class IdlePage(QtCore.QObject):
         self.mapViewIdle.viewport().installEventFilter(self)
 
         if self.btnLocalization:
-            self.btnLocalization.clicked.connect(lambda: QtWidgets.QMessageBox.information(self.ui, "Локализация", "Заглушка."))
+            self.btnLocalization.setCheckable(True)
+            self.btnLocalization.toggled.connect(self._on_loc_toggled)
         if self.btnManualLocalization:
             self.btnManualLocalization.setCheckable(True)
             self.btnManualLocalization.toggled.connect(self._on_manual_loc_toggled)
@@ -50,25 +51,49 @@ class IdlePage(QtCore.QObject):
                 return True
         return super().eventFilter(obj, ev)
 
-    def _go_maps(self):
-        if hasattr(self.ui, "to_maps"): self.ui.to_maps()
-
     def _go_drive(self):
         if hasattr(self.ui, "to_drive"): self.ui.to_drive()
 
+    def _on_loc_toggled(self, enabled: bool):
+        # Режим установки СИНИХ контрольных точек
+        self.state.loc_mode_idle = bool(enabled)
+        if self.btnLocalization:
+            self.btnLocalization.setText("Выбрать контрольную точку" + (" (вкл.)" if enabled else ""))
+    
+        if enabled:
+            # выключаем остальные режимы
+            if self.btnManualLocalization and self.btnManualLocalization.isChecked():
+                self.btnManualLocalization.setChecked(False)
+            if self.btnSelectGoalIdle and self.btnSelectGoalIdle.isChecked():
+                self.btnSelectGoalIdle.setChecked(False)
+
+
     def _on_manual_loc_toggled(self, enabled: bool):
+        # Режим ручной локализации (позиция робота)
         self.state.manual_loc_mode = bool(enabled)
         if self.btnManualLocalization:
             self.btnManualLocalization.setText("Локализация вручную" + (" (вкл.)" if enabled else ""))
-        if enabled and self.btnSelectGoalIdle and self.btnSelectGoalIdle.isChecked():
-            self.btnSelectGoalIdle.setChecked(False)
+
+        if enabled:
+            # выключаем остальные режимы
+            if self.btnLocalization and self.btnLocalization.isChecked():
+                self.btnLocalization.setChecked(False)
+            if self.btnSelectGoalIdle and self.btnSelectGoalIdle.isChecked():
+                self.btnSelectGoalIdle.setChecked(False)
+
 
     def _on_select_goal_idle_toggled(self, enabled: bool):
+        # Режим выбора цели (красный флаг / цель маршрута)
         self.state.select_goal_mode_idle = bool(enabled)
         if self.btnSelectGoalIdle:
             self.btnSelectGoalIdle.setText("Выбрать цель" + (" (вкл.)" if enabled else ""))
-        if enabled and self.btnManualLocalization and self.btnManualLocalization.isChecked():
-            self.btnManualLocalization.setChecked(False)
+
+        if enabled:
+            # выключаем остальные режимы
+            if self.btnManualLocalization and self.btnManualLocalization.isChecked():
+                self.btnManualLocalization.setChecked(False)
+            if self.btnLocalization and self.btnLocalization.isChecked():
+                self.btnLocalization.setChecked(False)
 
     def _on_map_click(self, x_px: float, y_px: float):
         if not getattr(self.state, "graph", None):
@@ -83,6 +108,9 @@ class IdlePage(QtCore.QObject):
             changed = True
         elif getattr(self.state, "select_goal_mode_idle", False):
             set_goal_px(clicked, self.state)
+            changed = True
+        elif getattr(self.state, "loc_mode_idle", False):
+            set_control_item_px(clicked, self.state)
             changed = True
         else:
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Включите «Локализация вручную» или «Выбрать цель».")
@@ -106,6 +134,7 @@ class IdlePage(QtCore.QObject):
                     redraw_route(self.state, self.ui)
                 except Exception as e:
                     print("[IDLE] redraw_route error:", e)
+                reset_route_progress(self.state)
                 # обновить верхнюю панель Drive (lblMinDist и т.д.)
                 try:
                     from robot_cmd import update_drive_panel

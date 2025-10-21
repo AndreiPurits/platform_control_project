@@ -1,4 +1,4 @@
-# lidar_udp_rx.py
+# lidar_to_udp.py
 import json, socket, threading
 from typing import List, Tuple
 from PyQt5 import QtCore

@@ -6,6 +6,91 @@ import math
 
 Point = Tuple[float, float]
 
+# ------------------ угол/поворот (плавная стрелка) ------------------
+_DEG = math.pi / 180.0
+_HEADING_DEADBAND = 7.0 * _DEG      # мёртвая зона ±3°
+_MAX_TURN_RATE_DPS = 120.0          # макс. скорость поворота, °/с
+AHEAD_PX_DEFAULT = 40.0  # насколько «вперёд» смотреть по маршруту, в пикселях
+
+def _heading_from_vector(dx: float, dy: float) -> float:
+    """Экранный угол (рад): 0 = вправо, +вниз = +90°."""
+    return math.atan2(dy, dx)
+
+def _target_point_ahead_px(cur_pos: Tuple[float,float],
+                           poly_px: List[Tuple[float,float]],
+                           start_i: int,
+                           ahead_px: float) -> Tuple[float,float]:
+    """
+    Возвращает точку на ломаной, отстоящую от cur_pos примерно на ahead_px по дуге.
+    Идём от сегмента start_i → вперёд, накапливая пиксельную длину.
+    Если до конца осталось меньше — вернём последний доступный.
+    """
+    if not poly_px or start_i >= len(poly_px)-1:
+        return poly_px[-1] if poly_px else cur_pos
+
+    # начинаем от ТЕКУЩЕЙ позиции (не от вершины), чтобы вектор не дёргался
+    px, py = cur_pos
+    left = float(ahead_px)
+
+    # текущий сегмент i: от вершины i до i+1
+    i = max(0, min(start_i, len(poly_px)-2))
+    # сначала учитываем остаток текущего сегмента от cur_pos до конца сегмента
+    ax, ay = poly_px[i]
+    bx, by = poly_px[i+1]
+    # проекция текущей позиции на сегмент i → т, точка q
+    vx, vy = bx-ax, by-ay
+    wx, wy = px-ax, py-ay
+    vv = vx*vx+vy*vy
+    if vv <= 1e-12:
+        t0 = 0.0
+        qx, qy = ax, ay
+    else:
+        t0 = (wx*vx + wy*vy)/vv
+        t0 = 0.0 if t0 < 0.0 else (1.0 if t0 > 1.0 else t0)
+        qx, qy = ax + t0*vx, ay + t0*vy
+
+    # пробуем доползти внутри текущего сегмента
+    seg_rest = math.hypot(bx-qx, by-qy)
+    if left <= seg_rest:
+        # точка впереди внутри текущего сегмента
+        tt = 0.0 if seg_rest <= 1e-9 else (left/seg_rest)
+        return (qx + tt*(bx-qx), qy + tt*(by-qy))
+    left -= seg_rest
+    i += 1
+
+    # дальше шагами по полилинии
+    while i < len(poly_px)-1 and left > 0.0:
+        ax, ay = poly_px[i]
+        bx, by = poly_px[i+1]
+        seg = math.hypot(bx-ax, by-ay)
+        if seg <= 1e-9:
+            i += 1
+            continue
+        if left <= seg:
+            t = left/seg
+            return (ax + t*(bx-ax), ay + t*(by-ay))
+        left -= seg
+        i += 1
+
+    # не хватило длины — берём последний
+    return poly_px[-1]
+
+def _angdiff(a, b):
+    """Нормализованная разность углов b-a в диапазон [-pi, pi]."""
+    d = (b - a + math.pi) % (2 * math.pi) - math.pi
+    return d
+
+def _step_heading(prev, target, dt):
+    """Плавный шаг к target: мёртвая зона + ограничение скорости поворота."""
+    if prev is None:
+        return target
+    diff = _angdiff(prev, target)
+    if abs(diff) <= _HEADING_DEADBAND:
+        return prev
+    max_step = _MAX_TURN_RATE_DPS * _DEG * max(0.0, float(dt))
+    if abs(diff) > max_step:
+        return prev + (max_step if diff > 0.0 else -max_step)
+    return target
 
 # ---------- сцена и карта ----------
 def ensure_scene(view: QtWidgets.QGraphicsView,
@@ -80,28 +165,6 @@ def redraw_route(state, ui: Optional[QtWidgets.QMainWindow] = None) -> None:
         setattr(state, holder, new_item)
 
 # ---------- маркеры ----------
-def make_robot_dot() -> QtWidgets.QGraphicsEllipseItem:
-    """Простой зелёный круг для обозначения позиции робота."""
-    r = 6
-    item = QtWidgets.QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r)
-    item.setBrush(QtGui.QBrush(QtGui.QColor("#00ff00")))  # зелёный
-    item.setPen(QtGui.QPen(QtGui.QColor("#006400"), 1))
-    item.setZValue(120)
-    return item
-
-
-def draw_robot_dot(scene: QtWidgets.QGraphicsScene,
-                   old_item: Optional[QtWidgets.QGraphicsItem],
-                   pos: Optional[Point]) -> Optional[QtWidgets.QGraphicsItem]:
-    """Отрисовать зелёный кружок-позицию."""
-    if old_item is not None and old_item.scene() is scene:
-        scene.removeItem(old_item)
-    if not pos:
-        return None
-    item = make_robot_dot()
-    item.setPos(pos[0], pos[1])
-    scene.addItem(item)
-    return item
 
 def _make_goal_dot() -> QtWidgets.QGraphicsEllipseItem:
     r = 5
@@ -110,6 +173,32 @@ def _make_goal_dot() -> QtWidgets.QGraphicsEllipseItem:
     item.setPen(QtGui.QPen(QtGui.QColor("#222"), 1))
     item.setZValue(120)
     return item
+
+def _make_arrow() -> QtWidgets.QGraphicsPolygonItem:
+    # стрелка вдоль +X (вправо)
+    poly = QtGui.QPolygonF([
+        QtCore.QPointF( 12,  0),  # нос вправо
+        QtCore.QPointF(-10,  6),
+        QtCore.QPointF( -6,  0),
+        QtCore.QPointF(-10, -6),
+    ])
+    item = QtWidgets.QGraphicsPolygonItem(poly)
+    item.setBrush(QtGui.QBrush(QtGui.QColor("#ffffff")))
+    item.setPen(QtGui.QPen(QtGui.QColor("#333333"), 1))
+    item.setZValue(120)
+    return item
+
+def draw_robot_arrow(scene, old_item, pos, yaw_rad=None):
+    if old_item is not None and old_item.scene() is scene:
+        scene.removeItem(old_item)
+    if not pos:
+        return None
+    it = _make_arrow()
+    it.setPos(pos[0], pos[1])
+    if yaw_rad is not None:
+        it.setRotation(- (yaw_rad * 180.0 / math.pi))  # 0рад=вправо; вниз=+90° → поворачиваем на -90
+    scene.addItem(it)
+    return it
 
 def draw_goal_marker(scene: QtWidgets.QGraphicsScene,
                      old_item: Optional[QtWidgets.QGraphicsItem],
@@ -194,9 +283,9 @@ def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
     yaw = getattr(state, "robot_heading_rad", None)
 
     if scene is getattr(state, "_idle_scene", None):
-        state.idle_robot_item = draw_robot_dot(
+        state.idle_robot_item = draw_robot_arrow(
             scene, getattr(state, "idle_robot_item", None),
-            getattr(state, "robot_px", None)
+            getattr(state, "robot_px", None), yaw
         )
         state.idle_goal_item  = draw_goal_marker(
             scene, getattr(state, "idle_goal_item",  None),
@@ -216,9 +305,9 @@ def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
                 state.idle_control_items.append(it)
 
     elif scene is getattr(state, "_drive_scene", None):
-        state.drive_robot_item = draw_robot_dot(
+        state.drive_robot_item = draw_robot_arrow(
             scene, getattr(state, "drive_robot_item", None),
-            getattr(state, "robot_px", None)
+            getattr(state, "robot_px", None), yaw
         )
         state.drive_goal_item  = draw_goal_marker(
             scene, getattr(state, "drive_goal_item",  None),
@@ -237,48 +326,34 @@ def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
             if it:
                 state.drive_control_items.append(it)
 
-def redraw_radar_points(scene: QtWidgets.QGraphicsScene,
-                        pts_m,
-                        meters_to_px: float = 40.0,
-                        state=None):
-    """
-    Бэйзлайн: каждый вызов полностью очищает предыдущие точки радара
-    и рисует заново простые кружки.
-    """
-    if not scene:
-        return
-
-    # 1) очистить прошлые "радарные" элементы
-    old = getattr(state, "_radar_items", None) if state else None
-    if old:
-        for it in old:
-            try:
-                if it and it.scene() is scene:
-                    scene.removeItem(it)
-            except Exception:
-                pass
-    if state:
-        state._radar_items = []
-
-    # 2) нарисовать заново
-    items = []
+# (опционально) точки лидара
+def draw_radar_points(scene: QtWidgets.QGraphicsScene, pts_m, meters_to_px: float = 40.0):
     for (x, y) in pts_m:
         xp = x * meters_to_px
-        yp = -y * meters_to_px   # ось Y вниз на экране
-        dot = QtWidgets.QGraphicsEllipseItem(xp-1, yp-1, 2, 2)
+        yp = -y * meters_to_px
+        dot = QtWidgets.QGraphicsEllipseItem(xp - 1, yp - 1, 2, 2)
         dot.setBrush(QtGui.QBrush(QtGui.QColor("#00bcd4")))
         dot.setPen(QtGui.QPen(QtCore.Qt.NoPen))
         dot.setZValue(50)
         scene.addItem(dot)
-        items.append(dot)
-
-    if state is not None:
-        state._radar_items = items
 
 # ===================== АНИМАЦИЯ МАРШРУТА =====================
+# ВАЖНО: никаких импортов robot_cmd сверху — чтобы не ловить циклический импорт.
 def reset_route_progress(state):
     state.route_done_m = 0.0
     state._route_cum_m = None
+
+def _nearest_index_on_poly(poly, pxy):
+    if not poly:
+        return 0
+    px, py = float(pxy[0]), float(pxy[1])
+    best_i, best_d2 = 0, float("inf")
+    for i, (x, y) in enumerate(poly):
+        d2 = (x - px)*(x - px) + (y - py)*(y - py)
+        if d2 < best_d2:
+            best_d2 = d2
+            best_i = i
+    return best_i
 
 def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
     # дамп состояния перед стартом (если есть метод)
@@ -487,7 +562,6 @@ def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
 
     print(f"[ANIM] timer started, interval={state._route_timer.interval()} ms", flush=True)
     return True    
-
 def stop_route_animation(state, keep_progress: bool = True):
     try:
         if hasattr(state, "_route_timer") and state._route_timer and state._route_timer.isActive():
