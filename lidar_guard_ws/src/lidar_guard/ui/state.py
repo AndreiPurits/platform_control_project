@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 from typing import List, Tuple, Optional
 from PyQt5 import QtWidgets
-
+import os
 class AppState:
     def __init__(self):
         # Карта
@@ -10,32 +10,50 @@ class AppState:
         self.graph = None
         self.points_px = None
         self.meters_per_pixel = None
-
+        self.m_per_px_x = 0.0
+        self.m_per_px_y = 0.0
         self.robot_px = None
         self.goal_px  = None
+
         self.route_pts_px = []
         self.route_pts_m = []
-        self.route_len_m  = 0.0
-        self.route_done_m = 0.0
-        self.route_contr_m = 0.0
 
+        self.route_len_m  = 0.0
+        self.route_len_px = 0.0
+        self.route_done_m = 0.0
         self.junctions_px = []
 
-        # Сплайн карты (в пикселях)
+        self.jdist = None
+        self.next_turn_dir = None
+        self.route_contr_m = 0.0
+
+        self.route_cum_px = []
+
+
+        self.speed_mps = 0.0
         self.spline_polyline: Optional[List[Tuple[float, float]]] = None
 
-        # Индексы на сплайне (логическое состояние — переносимо между экранами)
         self.robot_idx: Optional[int] = None   # белый флаг (позиция робота)
         self.goal_idx: Optional[int]  = None   # красный флаг (контрольная точка)
         self.control_pts_px: list[tuple[float, float]] = []
 
-        # Режимы
         self.manual_loc_mode: bool = False       # IDLE: режим «поставить флаг»
         self.select_goal_mode_idle: bool = False # IDLE: режим «выбора цели»
         self.select_goal_mode_drive: bool = False# DRIVE: режим «выбора цели»
         self.is_running: bool = False            # DRIVE: пуск/стоп
         self.loc_mode_idle: bool = False 
         self.loc_mode_drive: bool = False 
+
+
+        # LIDAR
+
+        self.lidar_snap_enabled = False
+        self.lidar_px_hint = None
+        self.lidar_snap_step_px = 3.0
+        self.lidar_match = None        
+        self.safety_stop = False          # глобальный флаг STOP по лидару
+        self._lidar_last_pts = []         # последние принятые точки лидара ([(x,y),...])
+
 
         # UI-элементы сцены, чтобы убирать/перерисовывать
         # Idle
@@ -52,4 +70,97 @@ class AppState:
         self.drive_route_item: QtWidgets.QGraphicsItem = None
         self.drive_control_items: list = []
 
+        self.dataset_mode: bool = False                 # включили кнопку «Датасет» на Idle
+        self.dataset_root: str = os.path.expanduser("~/datasets")  # базовая директория
+        self.map_name: str | None = None                # имя текущей карты (без .png)
+
+        self.capture_step_m: float = 3.0                # каждые 3 метра
+        self._last_capture_m: float = 0.0               # от какого пройденного метра отсчитываем
+        self._dataset_active: bool = False              # идёт ли сейчас запись (пуск в датасете)
+
+        # ---- Лидары ----
+        # сырые точки (могут приходить по UDP из разных портов)
+        self._lidar_front_last_pts = []
+        self._lidar_rear_last_pts  = []
+
+        # глобальный флаг STOP (как и раньше, “есть ли стоп вообще”)
+        self.safety_stop       = False
+        self.safety_stop_front = False
+        self.safety_stop_rear  = False
+
+        # ПЕРЕДНИЙ лидар (смотрит вперёд)
+        self.lidar_front_sector_half_deg   = 15.0
+        self.lidar_front_stop_distance_m   = 2.0
+        self.lidar_front_ignore_radius_m   = 0.7
+        self.lidar_front_stop_min_points   = 3
+        self.lidar_front_mount_yaw_rad     = 0.0
+
+        # ЗАДНИЙ лидар (смотрит назад)
+        self.lidar_rear_sector_half_deg    = 25.0
+        self.lidar_rear_stop_distance_m    = 1
+        self.lidar_rear_ignore_radius_m    = 0.01
+        self.lidar_rear_stop_min_points    = 3
+        self.lidar_rear_mount_yaw_rad      = 0.0  
+
+        self.pwm_base_us = 1700
+        self.har_rear_lidar = False
+
+        # «зелёный трек» — постоянный
+        self.visited_path_px: list[tuple[float,float]] = []
+        self.drive_visited_item: QtWidgets.QGraphicsPathItem | None = None
+        self.capture_interval_m = 3.0
+        self.camera_available = True   
+        self.lidar_available  = True
+        self._lidar_last_pts  = []          # сюда кладём последние точки
+        self._lidar_last_ts   = 0
+
+        # --- Camera control (открываем/закрываем в DrivePage) ---
+        self.cam_enabled: bool = True     # можно быстро вырубить камеру логически
+        self.cam_index: int = 0           # индекс видеоустройства (0 по умолчанию)
+        self._cv2_cap = None              # handle cv2.VideoCapture
+
+        # --- Dataset capture (унифицировано) ---
+        self.dataset_mode: bool = False           # вошли через «Датасет»
+        self.dataset_root: str = os.path.expanduser("~/datasets")
+        self.map_name: Optional[str] = None       # имя карты без .png (заполняем при pick_map_and_load)
+        self.dataset_step_m: float = 3.0          # шаг сохранения, м
+        self.dataset_last_snap_m: float = 0.0     # на каком пройденном метре последний снимок
+
+        # кэш папок под текущую карту (чтобы не вычислять каждый раз)
+        self.dataset_photos_dir: Optional[str] = None
+        self.dataset_lidar_dir: Optional[str] = None
+
+        # камера
+        self.cam_device = 0
+        self.cam_w = 1280
+        self.cam_h = 720
+        self.cam_fps = 30
+        self._cam = None                  # cv2.VideoCapture
+        self._cam_timer = None            # QtCore.QTimer
+        self._last_cam_frame = None       # numpy ndarray BGR
         
+        # ограничения/калибровка
+        self.max_speed_mps = 5       # физический максимум
+        self.min_pwm = 60                 # чтобы моторы реально тронулись
+        self.pwm_per_mps = 40.0           # калибровка: м/с -> ШИМ
+        self.steer_kp = 1.5               # усиление по ошибке курса
+        self.steer_deadband_rad = 0.05    # мёртвая зона ~3°
+        self.turn_hard_err_rad = 0.7      # >40° — «жёсткий поворот» одной гусеницей
+        self.turn_only_pwm = 140          # ШИМ при «жёстком повороте»
+        self.turn_around_requested = False  # флаг «развернуться»
+        
+        self.l_pwm = 0
+        self.r_pwm = 0
+        self.b_pwm = 0
+        self.yawrate_radps = 0.0
+        
+        self.road_frac = 0.0
+        self.stripe_frac = 0.0
+        self.road_frac_ema = None
+        self.stripe_frac_ema = None
+        self.road_state = "unknown"   # "no_road" | "far_road" | "on_road" | "unknown"
+        self.road_on = False          # True, если мы точно «на дороге»
+        
+        self.manual_l_pwm = 0
+        self.manual_r_pwm = 0
+        self.manual_b_pwm = 0

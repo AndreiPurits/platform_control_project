@@ -25,6 +25,8 @@ class Main(QtWidgets.QMainWindow):
         uic.loadUi(UI_PATH, self)
         self.setWindowTitle("Platform GUI")
 
+
+
         # глобальное состояние
         self.state = AppState()
 
@@ -45,33 +47,27 @@ class Main(QtWidgets.QMainWindow):
         self.btnMapPicker: QtWidgets.QPushButton = self.findChild(QtWidgets.QPushButton, "btnMapPicker")
         self.btnEStop: QtWidgets.QPushButton = self.findChild(QtWidgets.QPushButton, "btnEStop")
 
-        # старт/стоп
-        if self.btnStartStop:
-            self.btnStartStop.setCheckable(True)
-            self.btnStartStop.setChecked(False)
-            self.btnStartStop.setText("Пуск")
-            self.btnStartStop.toggled.connect(self._on_startstop_toggled)
-
-        # выбор карты с DRIVE возможен только при стопе
-        if self.btnMapPicker:
-            self.btnMapPicker.clicked.connect(self._on_drive_pick_map)
-
-        # Кнопка "Выбор карты" на IDLE вызывает тот же пикер
-        btn_choose_idle = self.findChild(QtWidgets.QPushButton, "btnChooseMap")
-        if btn_choose_idle:
-            btn_choose_idle.clicked.connect(self.pick_map_and_load)
-
         # E-STOP (заглушка)
         if self.btnEStop:
-            self.btnEStop.clicked.connect(lambda: QtWidgets.QMessageBox.information(
-                self, "E-STOP", "Аварийный стоп (заглушка)")
-            )
+            self.btnEStop.clicked.connect(self._on_close_clicked)
 
         # стартуем в IDLE
         self.to_idle()
         if self.statusBar():
             self.statusBar().showMessage("Готово", 2000)
-
+            
+    def closeEvent(self, ev):  
+        try:
+            if hasattr(self, "drive") and self.drive:
+                self.drive.shutdown()
+        except Exception as e:
+            print("[MAIN] drive.shutdown error:", e, flush=True)
+        try:
+            from robot_cmd import close_link
+            close_link()
+        except Exception:
+            pass
+        super().closeEvent(ev)
     # ----------- навигация между экранами -----------
     def to_idle(self):
         self.stack.setCurrentWidget(self.pageIdle)
@@ -81,6 +77,20 @@ class Main(QtWidgets.QMainWindow):
             self.findChild(QtWidgets.QGraphicsView, "mapViewIdle"),
             self.findChild(QtWidgets.QGraphicsView, "mapViewDrive"),
         )
+        
+    def _on_close_clicked(self):
+        """Полное завершение приложения (включая потоки камеры и лидара)."""
+        try:
+            # безопасно остановить DrivePage
+            if hasattr(self, "drive"):
+                try:
+                    self.drive.shutdown()
+                except Exception:
+                    pass
+            QtWidgets.QApplication.quit()
+        except Exception as e:
+            print("[CLOSE] error:", e, flush=True)
+            os._exit(0)  # жёсткий выход на крайний случай
 
     def to_drive(self):
         self.stack.setCurrentWidget(self.pageDrive)
@@ -91,19 +101,6 @@ class Main(QtWidgets.QMainWindow):
             self.findChild(QtWidgets.QGraphicsView, "mapViewDrive"),
         )
 
-    # ----------- верхний бар DRIVE -----------
-    def _on_startstop_toggled(self, checked: bool):
-        self.state.is_running = bool(checked)
-        if self.btnStartStop:
-            self.btnStartStop.setText("Стоп" if checked else "Пуск")
-
-        # выбор карты разрешён только при стопе
-        if self.btnMapPicker:
-            self.btnMapPicker.setEnabled(not self.state.is_running)
-
-        # подсказка в статус-баре
-        if self.statusBar():
-            self.statusBar().showMessage("START" if checked else "STOP", 1500)
 
     def _on_drive_pick_map(self):
         if self.state.is_running:
@@ -199,6 +196,31 @@ class Main(QtWidgets.QMainWindow):
             return
 
         self.state.active_map_path = fname
+        # main_runtime.py (в конце pick_map_and_load, после self.state.active_map_path = fname)
+        base = os.path.basename(fname)
+        name, _ = os.path.splitext(base)
+        self.state.map_name = name
+
+        # создать /datasets/photos/<map>/ и /datasets/lidar/<map>/
+        try:
+            photos_dir = os.path.join(self.state.dataset_root, "photos", name)
+            lidar_dir  = os.path.join(self.state.dataset_root, "lidar",  name)
+            os.makedirs(photos_dir, exist_ok=True)
+            os.makedirs(lidar_dir,  exist_ok=True)
+            print(f"[DATASET] dirs ready:\n  {photos_dir}\n  {lidar_dir}", flush=True)
+        except Exception as e:
+            print("[DATASET] mkdir error:", e, flush=True)
+
+        # очистить ЗЕЛЁНЫЙ трек (новая карта = новый слой)
+        try:
+            self.state.visited_path_px = []
+            if getattr(self.state, "drive_visited_item", None):
+                sc = getattr(self.state, "_drive_scene", None)
+                if sc and self.state.drive_visited_item.scene() is sc:
+                    sc.removeItem(self.state.drive_visited_item)
+            self.state.drive_visited_item = None
+        except Exception:
+            pass
 
         # показать карту в обеих сценах
         from graphics import show_map_on_views
@@ -216,7 +238,8 @@ class Main(QtWidgets.QMainWindow):
             ok = load_graph_and_points_for(fname, self.state)
         except Exception as e:
             print("[MAP] load_graph_and_points_for error:", e, flush=True)
-
+        from routing import refresh_all_overlays
+        refresh_all_overlays(state, ui.viewIdle, ui.viewDrive)
         # перерисовать оверлеи
         try:
             refresh_all_overlays(self.state, idle_view, drive_view)
@@ -232,6 +255,13 @@ class Main(QtWidgets.QMainWindow):
                 btn.setText("Пуск")
         except Exception:
             pass
+        
+        # После загрузки карты обновляем карту/имя и дергаем RoadSeg под текущую карту
+        try:
+            if hasattr(self, "drive") and self.drive is not None:
+                self.drive._reload_seg_for_current_map()
+        except Exception as e:
+            print("[SEG] reload on new map error:", e, flush=True)
 
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -242,7 +272,8 @@ def main():
     app.setApplicationName("Platform GUI")
 
     w = Main()
-    w.resize(1280, 800)
+    w.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+    w.setGeometry(0, 0, 1200, 800)     # заполняем экран полностью
     w.show()
     sys.exit(app.exec_())
 

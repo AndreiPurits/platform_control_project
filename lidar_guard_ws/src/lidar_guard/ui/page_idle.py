@@ -22,16 +22,9 @@ class IdlePage(QtCore.QObject):
         self.btnManualLocalization: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnManualLocalization")
         self.btnStart: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnStart")
         self.btnSelectGoalIdle: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnSelectGoalIdle")
-
-        if self.btnStart:      
-            self.btnStart.clicked.connect(self._go_drive)
-
-        ensure_scene(self.mapViewIdle); 
-        try: prepare_view(self.mapViewIdle)
-        except: pass
-        self.mapViewIdle.setMouseTracking(True)
-        self.mapViewIdle.viewport().installEventFilter(self)
-
+        self.btnDataset: QtWidgets.QPushButton = ui.findChild(QtWidgets.QPushButton, "btnDataset")
+        if self.btnChooseMap:
+            self.btnChooseMap.clicked.connect(self._on_choose_map_clicked)
         if self.btnLocalization:
             self.btnLocalization.setCheckable(True)
             self.btnLocalization.toggled.connect(self._on_loc_toggled)
@@ -41,7 +34,61 @@ class IdlePage(QtCore.QObject):
         if self.btnSelectGoalIdle:
             self.btnSelectGoalIdle.setCheckable(True)
             self.btnSelectGoalIdle.toggled.connect(self._on_select_goal_idle_toggled)
+        if self.btnDataset:
+                self.btnDataset.clicked.connect(self._on_dataset_clicked)
+        if self.btnStart:      
+            self.btnStart.clicked.connect(self._go_drive)
 
+        ensure_scene(self.mapViewIdle); 
+        try: prepare_view(self.mapViewIdle)
+        except: pass
+        self.mapViewIdle.setMouseTracking(True)
+        self.mapViewIdle.viewport().installEventFilter(self)
+
+    def _on_choose_map_clicked(self):
+        """Открыть диалог выбора карты и показать её в IDLE (без перехода на DRIVE)."""
+        if hasattr(self.ui, "pick_map_and_load"):
+            try:
+                self.ui.pick_map_and_load()
+            except Exception as e:
+                print("[IDLE] pick_map_and_load error:", e, flush=True)
+        else:
+            QtWidgets.QMessageBox.warning(self.ui, "Ошибка", "В Main нет метода pick_map_and_load().")
+        # ---- IDLE: Датасет -> выбрать карту -> перейти на DRIVE
+
+    def _on_dataset_clicked(self):
+        # 1) выбрать карту
+        if hasattr(self.ui, "pick_map_and_load"):
+            try:
+                self.ui.pick_map_and_load()
+            except Exception as e:
+                print("[IDLE] pick_map_and_load error:", e, flush=True)
+                return
+        else:
+            QtWidgets.QMessageBox.warning(self.ui, "Ошибка", "В Main нет метода pick_map_and_load().")
+            return
+
+        # если карту не выбрали (диалог закрыли), выходим
+        if not getattr(self.state, "active_map_path", None):
+            return
+
+        # 2) помечаем режим датасета
+        self.state.dataset_mode = True
+
+        # 3) переходим на DRIVE
+        stack = self.ui.findChild(QtWidgets.QStackedWidget, "stackRoot")
+        pageDrive = self.ui.findChild(QtWidgets.QWidget, "pageDrive")
+        if stack and pageDrive:
+            stack.setCurrentWidget(pageDrive)
+
+        # 4) индикаторы по умолчанию
+        try:
+            from status import set_indicator
+            set_indicator(self.ui.findChild(QtWidgets.QLabel, "indBattery"), "ok")
+            set_indicator(self.ui.findChild(QtWidgets.QLabel, "indLidar"),   "ok")
+        except Exception:
+            pass
+            
     # события мыши
     def eventFilter(self, obj, ev):
         if obj is self.mapViewIdle.viewport():
