@@ -42,11 +42,11 @@ import os
 import json
 import math
 import heapq
-
+import numpy as np
 Point = Tuple[float, float]
 
 EDGE_POLY_KEY_PX = "poly_px"
-EDGE_POLY_KEY_M  = "poly_m"     # не используем для метрик напрямую
+EDGE_POLY_KEY_M  = "poly_m"  
 
 # ---------------- utils ----------------
 
@@ -93,6 +93,75 @@ def _nearest_from_list(target: Point, cloud: List[Point]) -> Point:
 
 
 # ---------------- загрузка артефактов ----------------
+import os
+import json
+def apply_scale_from_graph(map_png_path: str, state) -> bool:
+    """
+    Читает масштаб из <basename>_graph.json и пишет в state.m_per_px_x / state.m_per_px_y.
+
+    Поддерживаем варианты:
+      - graph["m_per_px_x"], graph["m_per_px_y"]
+      - graph["meta"]["m_per_px_x/y"] или meta["m_per_px"]
+      - graph["scale"]["m_per_px_x/y"]  <-- твой текущий формат
+    """
+    base, _ = os.path.splitext(map_png_path)
+    graph_path = base + "_graph.json"
+
+    if not os.path.exists(graph_path):
+        print(f"[MAP] graph json not found: {graph_path}", flush=True)
+        return False
+
+    try:
+        with open(graph_path, "r", encoding="utf-8") as f:
+            graph = json.load(f)
+    except Exception as e:
+        print(f"[MAP] failed to load graph json: {graph_path}  error={e}", flush=True)
+        return False
+
+    if not isinstance(graph, dict):
+        print("[MAP] graph json is not a dict", flush=True)
+        return False
+
+    mppx = graph.get("m_per_px_x")
+    mppy = graph.get("m_per_px_y")
+
+    # --- NEW: scale.{m_per_px_x, m_per_px_y} ---
+    if (mppx is None) or (mppy is None):
+        sc = graph.get("scale")
+        if isinstance(sc, dict):
+            if mppx is None:
+                mppx = sc.get("m_per_px_x", sc.get("m_per_px"))
+            if mppy is None:
+                mppy = sc.get("m_per_px_y", sc.get("m_per_px"))
+
+    # --- fallback: meta.{m_per_px_x, m_per_px_y, m_per_px} ---
+    if (mppx is None) or (mppy is None):
+        meta = graph.get("meta")
+        if isinstance(meta, dict):
+            if mppx is None:
+                mppx = meta.get("m_per_px_x", meta.get("m_per_px"))
+            if mppy is None:
+                mppy = meta.get("m_per_px_y", meta.get("m_per_px"))
+
+    if not isinstance(mppx, (int, float)) or not isinstance(mppy, (int, float)):
+        print("[MAP] no valid m_per_px_x / m_per_px_y in graph.json", flush=True)
+        return False
+
+    state.m_per_px_x = float(mppx)
+    state.m_per_px_y = float(mppy)
+
+    # --- LOG: финальный масштаб ---
+    m_per_px_avg = 0.5 * (state.m_per_px_x + state.m_per_px_y)
+    px_per_m = 1.0 / max(m_per_px_avg, 1e-9)
+    print(
+        "[SCALE] loaded from graph.json:"
+        f" m_per_px_x={state.m_per_px_x:.12f}"
+        f" m_per_px_y={state.m_per_px_y:.12f}"
+        f" avg_m_per_px={m_per_px_avg:.12f}"
+        f" avg_px_per_m={px_per_m:.3f}",
+        flush=True
+    )
+    return True
 
 def load_graph_and_points_for(png_path: str, state) -> bool:
     """
@@ -103,50 +172,81 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
     И выставляет:
       state.graph
       state.points_px
-      state.m_per_px_x / state.m_per_px_y (для известных карт)
-      state.junctions_px               (склеенные развилки)
+      state.m_per_px_x / state.m_per_px_y  (приоритет: graph.json -> fallback)
+      state.junctions_px                   (склеенные развилки)
     """
     base, _ = os.path.splitext(png_path)
     graph_json  = f"{base}_graph.json"
     points_json = f"{base}_points_pixels.json"
 
-    print("[ROUTING] ---- load_graph_and_points_for ----")
-    print("[ROUTING] png:", png_path)
-    print("[ROUTING] graph exists:", os.path.isfile(graph_json))
-    print("[ROUTING] points exists:", os.path.isfile(points_json))
+    print("[ROUTING] ---- load_graph_and_points_for ----", flush=True)
+    print("[ROUTING] png:", png_path, flush=True)
+    print("[ROUTING] graph exists:", os.path.isfile(graph_json), flush=True)
+    print("[ROUTING] points exists:", os.path.isfile(points_json), flush=True)
 
     if not (os.path.isfile(graph_json) and os.path.isfile(points_json)):
-        print("[ROUTING] missing graph/points files")
+        print("[ROUTING] missing graph/points files", flush=True)
         return False
 
     try:
         # --- загрузка графа и точек ---
         with open(graph_json, "r", encoding="utf-8") as f:
             graph = json.load(f)
+
         with open(points_json, "r", encoding="utf-8") as f:
             pts_raw = json.load(f)
 
         if isinstance(pts_raw, dict) and "points" in pts_raw:
             pts_raw = pts_raw["points"]
+
         pts = [(float(x), float(y)) for x, y in pts_raw] if isinstance(pts_raw, list) else []
 
         state.graph = graph
         state.points_px = pts
 
-        # --- масштаб только для известных карт (если надо, можно расширить) ---
-        name = os.path.basename(png_path).lower()
-        if "poly_asf" in name:
-            state.m_per_px_x = 0.8342405111938622
-            state.m_per_px_y = 1.2604320351524956
-        elif "poly_grd" in name:
-            state.m_per_px_x = 1.670743420684952
-            state.m_per_px_y = 1.4202174529355311
-        else:
-            # по умолчанию хоть что-то, чтобы не было нулей
-            state.m_per_px_x = float(getattr(state, "m_per_px_x", 1.0) or 1.0)
-            state.m_per_px_y = float(getattr(state, "m_per_px_y", 1.0) or 1.0)
+        # ------------------------------------------------------------
+        # SCALE: приоритет = graph.json (apply_scale_from_graph),
+        # fallback = хардкод по имени (только если в json нет)
+        # ------------------------------------------------------------
+        got_scale = apply_scale_from_graph(png_path, state)
 
-        # --- развилки (junctions_px) ---
+        if not got_scale:
+            name = os.path.basename(png_path).lower()
+            if "poly_asf" in name:
+                state.m_per_px_x = 0.8342405111938622
+                state.m_per_px_y = 1.2604320351524956
+            elif "poly_grd" in name:
+                state.m_per_px_x = 1.670743420684952
+                state.m_per_px_y = 1.4202174529355311
+            else:
+                # по умолчанию хоть что-то, чтобы не было нулей
+                state.m_per_px_x = float(getattr(state, "m_per_px_x", 1.0) or 1.0)
+                state.m_per_px_y = float(getattr(state, "m_per_px_y", 1.0) or 1.0)
+
+            m_avg = 0.5 * (state.m_per_px_x + state.m_per_px_y)
+            print(
+                "[SCALE] fallback scale:"
+                f" m_per_px_x={state.m_per_px_x:.12f}"
+                f" m_per_px_y={state.m_per_px_y:.12f}"
+                f" avg_m_per_px={m_avg:.12f}",
+                flush=True
+            )
+
+        # --- LOG: финальный масштаб, который реально будет использоваться везде ---
+        m_avg = 0.5 * (float(state.m_per_px_x) + float(state.m_per_px_y))
+        px_per_m = 1.0 / max(m_avg, 1e-9)
+        print(
+            "[SCALE] FINAL:"
+            f" m_per_px_x={float(state.m_per_px_x):.12f}"
+            f" m_per_px_y={float(state.m_per_px_y):.12f}"
+            f" avg_m_per_px={m_avg:.12f}"
+            f" avg_px_per_m={px_per_m:.3f}",
+            flush=True
+        )
+
+        # ------------------------------------------------------------
+        # JUNCTIONS (junctions_px): узлы степени >= 3, склейка близких
+        # ------------------------------------------------------------
         try:
             nodes_px = graph.get("nodes", {}).get("px") or []
             edges    = graph.get("edges", []) or []
@@ -154,9 +254,8 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
 
             if n == 0:
                 state.junctions_px = []
-                print("[ROUTING] junctions_px: no nodes", flush=True)
             else:
-                # 1) считаем степень каждого узла
+                # 1) степень каждого узла
                 deg = [0] * n
                 for e in edges:
                     u = e.get("u")
@@ -167,12 +266,10 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
                     ):
                         deg[u] += 1
                         deg[v] += 1
-
-                # 2) сырые кандидаты: степень >= 3
+                # 2) кандидаты: степень >= 3
                 junction_candidates = [i for i, d in enumerate(deg) if d >= 3]
-                print(f"[ROUTING] raw junction candidates (deg>=3): {len(junction_candidates)}", flush=True)
 
-                # 3) склеиваем кандидатов в кластеры по радиусу THRESHOLD_PX
+                # 3) склейка кандидатов в кластеры по радиусу
                 THRESHOLD_PX = 10.0
                 junction_nodes: List[int] = []
 
@@ -193,17 +290,14 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
                     if not too_close:
                         junction_nodes.append(i)
 
-                # 4) сохраняем центры кластеров в state.junctions_px
+                # 4) сохраняем junctions_px
                 state.junctions_px = [
                     (float(nodes_px[i][0]), float(nodes_px[i][1]))
                     for i in junction_nodes
                 ]
 
-                print(
-                    f"[ROUTING] junctions_px fused (R={THRESHOLD_PX}px): "
-                    f"{len(state.junctions_px)}",
-                    flush=True
-                )
+                print(f"[ROUTING] junctions_px: {len(state.junctions_px)}", flush=True)
+
         except Exception as ex:
             state.junctions_px = []
             print("[ROUTING] junctions_px calc error:", ex, flush=True)
@@ -213,7 +307,6 @@ def load_graph_and_points_for(png_path: str, state) -> bool:
     except Exception as e:
         print("[ROUTING] load error:", e, flush=True)
         return False
-
 
 # ---------------- снэп позиций ----------------
 
@@ -245,7 +338,7 @@ def set_control_item_px(click_px: Point, state) -> List[Point]:
         state.control_pts_px = []
     state.control_pts_px.append(ctrl_pt)
     print(f"[ROUTING] Added control point: {ctrl_pt}", flush=True)
-    print(f"[ROUTING] Total control points: {len(state.control_pts_px)}", flush=True)
+    #print(f"[ROUTING] Total control points: {len(state.control_pts_px)}", flush=True)
     return state.control_pts_px
 
 
@@ -260,7 +353,10 @@ def build_route_from_robot_to_goal(state) -> bool:
       4) восстанавливаем полилинию route_pts_px
       5) считаем route_pts_m и route_len_m через (m_per_px_x, m_per_px_y)
     """
-    start = getattr(state, "robot_px", None)
+    if state.route_pts_px:
+        start = state.route_pts_px[-1]
+    else:
+        start = state.robot_px
     goal  = getattr(state, "goal_px",  None)
     graph = getattr(state, "graph", None)
     if not (start and goal and graph):
@@ -322,25 +418,43 @@ def build_route_from_robot_to_goal(state) -> bool:
     if not polyS or not polyG:
         print("[ROUTING] bad edge polylines", flush=True)
         return False
-
     # быстрый кейс: оба клика в одном ребре — просто подотрезок poly_px
     if ei_s == ei_g:
-        seg_px = _subpoly_idx(polyS, li_s, li_g)
-        state.route_pts_px = seg_px
+        pts_px = _subpoly_idx(polyS, li_s, li_g)
+        if not pts_px or len(pts_px) < 2:
+            print("[ROUTING] single-edge: empty segment", flush=True)
+            return False
 
-        # метрика ВСЕГДА через масштаб
+        # --- ДОПИСЫВАЕМ В ОБЩИЙ МАРШРУТ ---
+        old_px = getattr(state, "route_pts_px", None) or []
+        if old_px:
+            if old_px[-1] == pts_px[0]:
+                state.route_pts_px = old_px + pts_px[1:]
+            else:
+                state.route_pts_px = old_px + pts_px
+        else:
+            state.route_pts_px = pts_px
+
+        # --- МЕТРЫ ДОПИСЫВАЕМ АНАЛОГИЧНО ---
         mx = float(getattr(state, "m_per_px_x", 1.0) or 1.0)
         my = float(getattr(state, "m_per_px_y", 1.0) or 1.0)
-        state.route_pts_m = [(x * mx, y * my) for (x, y) in seg_px]
+
+        new_m = [(x * mx, y * my) for (x, y) in pts_px]
+        old_m = getattr(state, "route_pts_m", None) or []
+        if old_m:
+            if old_m[-1] == new_m[0]:
+                state.route_pts_m = old_m + new_m[1:]
+            else:
+                state.route_pts_m = old_m + new_m
+        else:
+            state.route_pts_m = new_m
+
+        # --- ДЛИНА: пересчёт по всему маршруту (надёжно) ---
         state.route_len_m = sum(_dist(a, b) for a, b in zip(state.route_pts_m, state.route_pts_m[1:]))
 
-        # сброс прогресса
-        state.route_progress_idx = 0
-        state.route_seg_off_m = 0.0
-        state.route_done_m = 0.0
-        state.route_finished = False
+        #print(f"[ROUTING] route (single edge, appended): px={len(state.route_pts_px)}  m={len(state.route_pts_m)}  L={state.route_len_m:.2f}", flush=True)
 
-        print(f"[ROUTING] route (single edge): px={len(state.route_pts_px)}  m={len(state.route_pts_m)}  L={state.route_len_m:.2f}", flush=True)
+        # прогресс НЕ сбрасываем
         compute_controls_on_route(state, eps_px=2.0)
         return True
 
@@ -351,9 +465,6 @@ def build_route_from_robot_to_goal(state) -> bool:
 
     adj_ext: List[List[Tuple[int, int, float]]] = [list(row) for row in adj]
     adj_ext.extend([[], []])  # для двух виртуальных
-
-    def _edge_len_px(poly_px: List[Point]) -> float:
-        return sum(_dist(a, b) for a, b in zip(poly_px, poly_px[1:]))
 
     def connect_virtual(idx_vrt: int, e_idx: int, l_idx: int):
         """
@@ -503,22 +614,33 @@ def build_route_from_robot_to_goal(state) -> bool:
         add_edge_segment(ei_s, li_s, len(polyS) - 1)
         add_edge_segment(ei_g, 0, li_g)
 
-    state.route_pts_px = pts_px
+    old_px = getattr(state, "route_pts_px", None) or []
 
+    if old_px:
+        # если сегмент начинается с той же точки, что уже есть в конце — пропускаем дубль
+        if pts_px and old_px[-1] == pts_px[0]:
+            state.route_pts_px = old_px + pts_px[1:]
+        else:
+            state.route_pts_px = old_px + pts_px
+    else:
+        state.route_pts_px = pts_px
     # --- МЕТРИКА: АНИЗО МАСШТАБ ---
     mx = float(getattr(state, "m_per_px_x", 1.0) or 1.0)
     my = float(getattr(state, "m_per_px_y", 1.0) or 1.0)
-    state.route_pts_m = [(x * mx, y * my) for (x, y) in state.route_pts_px]
-    state.route_len_m = sum(_dist(a, b) for a, b in zip(state.route_pts_m, state.route_pts_m[1:]))
+    new_pts_m = [(x * mx, y * my) for (x, y) in pts_px]
+    old_m = getattr(state, "route_pts_m", None) or []
 
-    # --- сброс прогресса для нового маршрута ---
-    state.route_progress_idx = 0
-    state.route_seg_off_m = 0.0
-    state.route_done_m = 0.0
-    state.route_finished = False
-
+    if old_m:
+        if new_pts_m and old_m[-1] == new_pts_m[0]:
+            state.route_pts_m = old_m + new_pts_m[1:]
+        else:
+            state.route_pts_m = old_m + new_pts_m
+    else:
+        state.route_pts_m = new_pts_m
+    state.route_len_m = sum(
+    _dist(a, b) for a, b in zip(state.route_pts_m, state.route_pts_m[1:])
+)
     print(f"[ROUTING] route pts: px={len(state.route_pts_px)}  m={len(state.route_pts_m)}  L={state.route_len_m:.2f}", flush=True)
-
     # --- КР: координаты вдоль маршрута в метрах ---
     compute_controls_on_route(state, eps_px=2.0)
     return True
@@ -562,7 +684,7 @@ def _cumlen(poly: List[Point]) -> List[float]:
     return acc
 
 
-def compute_controls_on_route(state, eps_px: float = 3.0):
+def compute_controls_on_route(state, eps_px: float = 2.0):
     """
     Считает state.route_controls_m = [(pt_px, s_m), ...].
 
@@ -626,7 +748,6 @@ def compute_controls_on_route(state, eps_px: float = 3.0):
 
 
 # ---------------- статусные тексты ----------------
-from typing import Optional
 
 def nearest_junction_distance(state, eps_px: float = 5.0) -> Optional[float]:
     """
@@ -688,9 +809,6 @@ def nearest_junction_distance(state, eps_px: float = 5.0) -> Optional[float]:
     state.jdist = float(best_delta)
     state._junc_idx = int(best_idx)
     return best_delta
-
-
-
 
 
 # UI-хелпер для перерисовки поверх карты
@@ -838,13 +956,9 @@ def build_route_via_goals(state) -> bool:
 
     # можно использовать контрольные точки (синие флаги) как КТ вдоль маршрута
     compute_controls_on_route(state, eps_px=3.0)
-
-    print(
-        f"[ROUTING] via_goals: total pts px={len(state.route_pts_px)} "
-        f"m={len(state.route_pts_m)} L={state.route_len_m:.2f}",
-        flush=True,
-    )
     return True
+
+
 def add_goal_point_px(click_px: Point, state) -> list[Point]:
     """
     Многоточечный режим: добавляет ещё одну цель в state.goal_pts_px
@@ -884,7 +998,7 @@ def clear_goals_and_route(state, also_clear_controls: bool = False):
         state.control_pts_px = []
         state.route_controls_m = []
 
-    from graphics import clear_route_visual, refresh_all_overlays
+    from graphics import clear_route_visual
     clear_route_visual(state, also_clear_data=False)  # графика маршрута
     # сами данные мы уже стерли выше
     try:
@@ -893,181 +1007,6 @@ def clear_goals_and_route(state, also_clear_controls: bool = False):
         refresh_all_overlays(state, idle_view, drive_view)
     except Exception:
         pass
-
-    print("[ROUTING] goals & route cleared", flush=True)
-
-def _polyline_len_px(pts: List[Point], i0: int, i1: int) -> float:
-    """
-    Длина ломаной pts[i0..i1] в пикселях.
-    Использует тот же helper _seg_len, что и остальной routing.
-    """
-    n = len(pts)
-    if n < 2:
-        return 0.0
-
-    i0 = max(0, min(n - 1, int(i0)))
-    i1 = max(0, min(n - 1, int(i1)))
-    if i0 >= i1:
-        return 0.0
-
-    s = 0.0
-    for a, b in zip(pts[i0:i1], pts[i0+1:i1+1]):
-        s += _seg_len(a, b)
-    return s
-
-
-def _signed_turn_angle(p_prev: Point, p_junc: Point, p_next: Point) -> float:
-    """
-    Возвращает подписанный угол (радианы):
-       + (плюс) = налево
-       - (минус) = направо
-       по трём точкам маршрута.
-    """
-    ax, ay = p_prev[0] - p_junc[0], p_prev[1] - p_junc[1]
-    bx, by = p_next[0] - p_junc[0], p_next[1] - p_junc[1]
-
-    la = math.hypot(ax, ay) or 1.0
-    lb = math.hypot(bx, by) or 1.0
-    ax /= la; ay /= la
-    bx /= lb; by /= lb
-
-    dot = max(-1.0, min(1.0, ax*bx + ay*by))
-    ang = math.acos(dot)
-    cross = ax*by - ay*bx  # знак
-    return ang * (1.0 if cross > 0 else -1.0)
-
-def detect_next_turn(state,
-                     lookahead_m: float = 50.0,
-                     min_angle_deg: float = 15.0):
-    """
-    Возвращает только turn ∈ {'left', 'right', 'straight'} или None.
-
-    Параллельно вешает на state:
-      state._detected_turn_j_idx  — индекс точки маршрута, где измеряли угол.
-    """
-    pts = getattr(state, "route_pts_px", None)
-    robot_px = getattr(state, "robot_px", None)
-    juncs = getattr(state, "junctions_px", None)
-
-    # по умолчанию — ничего не нашли
-    state._detected_turn_j_idx = None
-
-    if not pts or robot_px is None or not juncs:
-        return None
-
-    # pixels-per-meter
-    ppm = float(getattr(state, "ppm", getattr(state, "PPM", 80.0)) or 80.0)
-    lookahead_px = lookahead_m * ppm
-
-    # --- 1. Находим индекс ближайшей точки маршрута к роботу ---
-    rx, ry = robot_px
-    best_i = 0
-    best_d2 = float("inf")
-
-    for i, (x, y) in enumerate(pts):
-        d2 = (x - rx) ** 2 + (y - ry) ** 2
-        if d2 < best_d2:
-            best_d2 = d2
-            best_i = i
-
-    cur_idx = best_i
-    n = len(pts)
-
-    best_turn = None
-    best_dist_m = None
-    best_ji = None
-
-    # --- 2. Для каждого перекрёстка ищем его положение на маршруте ---
-    for jx, jy in juncs:
-        # ближайшая точка маршрута к перекрёстку
-        ji = 0
-        jd2 = float("inf")
-        for i, (x, y) in enumerate(pts):
-            d2 = (x - jx) ** 2 + (y - jy) **2
-            if d2 < jd2:
-                jd2 = d2
-                ji = i
-
-        if ji <= cur_idx:
-            # перекрёсток уже позади
-            continue
-
-        # расстояние вдоль ломаной от робота до перекрёстка (в px)
-        dist_px = _polyline_len_px(pts, cur_idx, ji)
-        if dist_px > lookahead_px:
-            continue
-
-        # угол поворота в точке ji
-        if 0 < ji < n - 1:
-            p_prev = pts[ji - 1]
-            p_junc = pts[ji]
-            p_next = pts[ji + 1]
-
-            ang = _signed_turn_angle(p_prev, p_junc, p_next)
-            ang_deg = ang * 180.0 / math.pi
-
-            if abs(ang_deg) < min_angle_deg:
-                turn = "straight"
-            elif ang_deg > 0:
-                turn = "left"
-            else:
-                turn = "right"
-
-            dist_m = dist_px / ppm
-
-            # выберем ближайший "осмысленный" поворот по расстоянию
-            if best_dist_m is None or dist_m < best_dist_m:
-                best_dist_m = dist_m
-                best_turn = turn
-                best_ji = ji
-
-    # запоминаем, где именно мы измеряли поворот
-    state._detected_turn_j_idx = best_ji
-    return best_turn
-
-
-def update_turn_hint(state,
-                     lookahead_m: float = 15.0,
-                     min_angle_deg: float = 35.0) -> None:
-    """
-    Обновляет:
-      state.next_turn_dir ∈ {'left','right','straight'} или None
-
-    Доп. логика: возле одного и того же перекрёстка направление
-    не прыгает left→right→left:
-      - если новый поворот противоположен старому,
-        и индекс перекрёстка почти тот же, то смену игнорируем.
-    """
-    prev_dir = getattr(state, "next_turn_dir", None)
-    prev_idx = getattr(state, "next_turn_j_idx", None)
-
-    turn = detect_next_turn(
-        state,
-        lookahead_m=lookahead_m,
-        min_angle_deg=min_angle_deg,
-    )
-    cur_idx = getattr(state, "_detected_turn_j_idx", None)
-
-    # --- Гистерезис по "одному перекрёстку" ---
-    if (
-        prev_dir in ("left", "right") and
-        turn in ("left", "right") and
-        turn != prev_dir and
-        prev_idx is not None and
-        cur_idx is not None and
-        abs(int(prev_idx) - int(cur_idx)) <= 5  # тот же самый узел/окрестность
-    ):
-        # Считаем, что это тот же перекрёсток, и не даём направлению прыгать.
-        # Просто выходим, не меняя next_turn_dir.
-        return
-
-    # принимаем новое значение
-    state.next_turn_dir = turn
-    state.next_turn_j_idx = cur_idx
-
-    # лог при изменении
-    if prev_dir != turn:
-        print(f"[TURN HINT] поворот {turn}", flush=True)
 
 def route_caption_text(state) -> str:
     L = float(getattr(state, "route_len_m", 0.0) or 0.0)
@@ -1093,7 +1032,7 @@ def route_caption_text(state) -> str:
 
     # Перекрёсток
     try:
-        jdist = nearest_junction_distance(state, eps_px=5.0)
+        jdist = nearest_junction_distance(state, eps_px=15.0)
     except Exception:
         jdist = None
 
@@ -1104,127 +1043,512 @@ def route_caption_text(state) -> str:
 
     return line1 + "\n" + line2 + "\n" + line3
 
+
 def update_progress_text_for_robot(*args, **kwargs) -> str:
     state = args[-1] if args else kwargs.get("state")
     return route_caption_text(state)
 
-import numpy as np
+
 
 def maybe_snap_robot_to_junction_by_camera(
     state,
     mask: np.ndarray,
-    max_graph_dist_m: float = 5.0,
-    min_jdist_m: float = 1.0,
-    max_jdist_m: float = 12.0,
+    # --- окна поиска перекрёстка ПО МАРШРУТУ (по метрам вдоль polyline) ---
+    search_ahead_m: float = 12.0,     # ищем junction в пределах done..done+ahead
+    search_behind_m: float = 12.0,    # и done-behind..done (чтобы уметь "снэпнуть назад")
+    # --- когда разрешаем снап относительно найденного перекрёстка ---
+    min_abs_delta_m: float = 2.0,     # если |s_junc - done| меньше — не снапаем (слишком поздно/шум)
+    max_abs_delta_m: float = 25.0,    # если |s_junc - done| больше — не снапаем (слишком рано/далеко)
+    # --- куда именно ставим done после детекта перекрёстка ---
+    snap_before_m: float = 12.0,      # ставим в точку на polyline: (s_junc - snap_before_m)
+    min_move_m: float = 0.3,          # чтобы не делать микро-снэпы
+    # --- фильтр "камерой увидели перекрёсток" ---
+    thr: float = 0.6,
+    side_thr: float = 0.12,
+    center_min: float = 0.10,
+    cooldown_s: float = 30.0,
+
+    # --- диагностика “не снапнулось” ---
+    diag_window_m: float = 12.0,      # если jdist <= diag_window_m и прошли/почти прошли junction — можно логнуть
 ) -> None:
     """
-    Камера говорит: "похоже, это перекрёсток" → аккуратно притягиваем robot_px
-    к ближайшему junction на графе и поправляем route_done_m.
+    Камера говорит "похоже перекрёсток" -> корректируем robot_px/route_done_m вдоль маршрута.
 
-    Условия:
-      - есть текущий маршрут (route_pts_px / route_pts_m),
-      - есть junctions_px,
-      - jdist (расстояние до перекрёстка по маршруту) попадает в окно [min_jdist_m, max_jdist_m],
-      - по маске видно "расширение" дороги (простейший детектор).
+    ВАЖНО:
+    - junction берём из state._junc_proj (строится update_junction_turn_hint), т.е. та же база из 10 перекрёстков.
+    - ищем ближайший подходящий junction и впереди, и сзади (в пределах окон search_*_m).
+    - снап ставит done = s_junc - snap_before_m (до перекрёстка), не в центр.
     """
+
+    import time, bisect
+
     poly_px = getattr(state, "route_pts_px", None) or []
     poly_m  = getattr(state, "route_pts_m",  None) or []
-    juncs   = getattr(state, "junctions_px", None) or []
     robot   = getattr(state, "robot_px", None)
-    jdist   = getattr(state, "jdist", None)  # ТВОЙ СТАРЫЙ jdist для расстояния
 
-    if (
-        mask is None
-        or mask.size == 0
-        or not poly_px
-        or not poly_m
-        or not juncs
-        or robot is None
-        or jdist is None
-    ):
+    if robot is None or mask is None or len(poly_px) < 2 or len(poly_m) < 2:
         return
 
-    # 1) проверяем, что мы реально "где-то у перекрёстка по маршруту"
-    if not (min_jdist_m <= jdist <= max_jdist_m):
+    now = time.monotonic()
+    done = float(getattr(state, "route_done_m", 0.0) or 0.0)
+
+    # ------------------------------------------------------------
+    # A) ВСПОМОГАТЕЛЬНО: диагностируем "проехали junction по графу, но snap не случился"
+    # ------------------------------------------------------------
+    # Условия: есть активный junction из хинта (или ближайший по jdist),
+    # done уже "прошёл" s_junc + pass_clear_m (или почти прошёл), но _last_cam_snap_j_id != j_id.
+    # Лог делаем 1 раз на junction, чтобы не спамить.
+    def _diag_missed(reason: str, details: str = ""):
+        j_id = getattr(state, "_active_turn_j_id", None)
+        s_j = getattr(state, "_active_turn_s_m", None)
+        if j_id is None or s_j is None:
+            return
+        # один раз на junction
+        key = (int(j_id),)
+        seen = getattr(state, "_diag_missed_junc", None)
+        if not isinstance(seen, set):
+            seen = set()
+            state._diag_missed_junc = seen
+        if key in seen:
+            return
+        seen.add(key)
+
+        turn = getattr(state, "next_turn_dir", None)
+        adeg = float(getattr(state, "turn_deg", 0.0) or 0.0)
+        lr = getattr(state, "_cam_junc_seen_lr", None)
+        lr_txt = f" cam_lr={lr}" if lr is not None else ""
+
+        print(
+            f"[CAM SNAP][MISS] j_id={int(j_id)} turn={turn} deg={adeg:.1f} "
+            f"done={done:.1f} s_j={float(s_j):.1f} reason={reason}{lr_txt}"
+            + (f" | {details}" if details else ""),
+            flush=True
+        )
+
+    # Если хинт активен и мы уже реально "перешагнули" junction, но снапа не было — логнем.
+    active_j = getattr(state, "_active_turn_j_id", None)
+    active_s = getattr(state, "_active_turn_s_m", None)
+    if active_j is not None and active_s is not None:
+        # Если мы уже прошли по маршруту junction + 1м, а снапа на этот j_id не было
+        if done >= float(active_s) + 1.0:
+            last_snap_j = getattr(state, "_last_cam_snap_j_id", None)
+            if last_snap_j is None or int(last_snap_j) != int(active_j):
+                # Причины ниже уточним в зависимости от состояния камеры/кулдауна.
+                cam_ts = float(getattr(state, "cam_junc_seen_ts", 0.0) or 0.0)
+                cam_ok = (cam_ts > 0.0) and ((now - cam_ts) <= 0.6)
+                if not cam_ok:
+                    _diag_missed("camera_not_seen_recent", "cam_junc_seen_ts too old or never set")
+                else:
+                    # камера видела, значит вероятнее всего отфильтровали окна/дельты/cooldown
+                    last_ts = float(getattr(state, "_last_cam_snap_ts", 0.0) or 0.0)
+                    if (now - last_ts) < float(cooldown_s):
+                        _diag_missed("cooldown", f"cooldown_s={cooldown_s:.1f} remaining={cooldown_s-(now-last_ts):.1f}s")
+                    else:
+                        # могли не найти proj или отсеять по abs_delta
+                        proj = getattr(state, "_junc_proj", None) or []
+                        if not proj:
+                            _diag_missed("no_junc_proj_cache", "update_junction_turn_hint hasn't built _junc_proj yet")
+                        else:
+                            _diag_missed("filtered_by_windows_or_abs_delta",
+                                         f"search_ahead_m={search_ahead_m} search_behind_m={search_behind_m} "
+                                         f"min_abs_delta_m={min_abs_delta_m} max_abs_delta_m={max_abs_delta_m}")
+
+    # ------------------------------------------------------------
+    # B) cooldown (не чаще 1 раза в cooldown_s)
+    # ------------------------------------------------------------
+    # твой флажок cam_junc_seen "живёт" 0.6s
+    if (now - float(getattr(state, "cam_junc_seen_ts", 0.0) or 0.0)) > 0.6:
+        state.cam_junc_seen = False
+
+    last_ts = float(getattr(state, "_last_cam_snap_ts", 0.0) or 0.0)
+    if (now - last_ts) < float(cooldown_s):
         return
 
-    # 2) грубый детектор: в верхней части кадра дорога «расширяется»
+    # ------------------------------------------------------------
+    # C) детект "похоже перекрёсток" по маске: 30% / 40% / 30%
+    # ------------------------------------------------------------
     H, W = mask.shape[:2]
-    thr = 0.6
-    road_bin = (mask > thr)
+    road_bin = (mask > float(thr))
 
-    band_h = max(3, int(H * 0.25))   # верхняя четверть кадра
+    band_h = max(3, int(H * 0.60))
     band = road_bin[:band_h, :]
 
-    # считаем заполненность слева/центра/справа
-    third = max(1, W // 3)
-    left_band   = band[:, :third]
-    center_band = band[:, third:2*third]
-    right_band  = band[:, 2*third:]
+    wL = int(W * 0.30)
+    wC = int(W * 0.40)
+    wR = W - (wL + wC)
+    if wR < 1:
+        wR = 1
+        wC = max(1, W - wL - wR)
 
-    lf = float(left_band.mean())
-    cf = float(center_band.mean())
-    rf = float(right_band.mean())
+    left_band   = band[:, :wL]
+    center_band = band[:, wL:wL + wC]
+    right_band  = band[:, wL + wC:]
 
-    # простое условие: перекрёсток, когда по сравнению с "прямой дорогой"
-    # заполняются боковые зоны (типа "есть ещё ветви")
-    # пороги можно будет потом крутить
-    EXTRA = 0.04
-    if (lf < cf + EXTRA) and (rf < cf + EXTRA):
-        # похоже, просто прямая дорога, без явных боковых ответвлений
+    lf = float(left_band.mean()) if left_band.size else 0.0
+    cf = float(center_band.mean()) if center_band.size else 0.0
+    rf = float(right_band.mean()) if right_band.size else 0.0
+
+    has_left   = (lf > float(side_thr))
+    has_right  = (rf > float(side_thr))
+    has_center = (cf > float(center_min))
+
+    if not (has_center and (has_left or has_right)):
+        # если по графу уже близко к junction — можно лаконично сообщить почему камера не подтверждает
+        jdist = getattr(state, "jdist", None)
+        if jdist is not None and float(jdist) <= float(diag_window_m):
+            # один раз на активный junction (чтобы не спамить)
+            active_j = getattr(state, "_active_turn_j_id", None)
+            if active_j is not None:
+                key = ("cam_reject", int(active_j))
+                seen = getattr(state, "_diag_cam_reject", None)
+                if not isinstance(seen, set):
+                    seen = set()
+                    state._diag_cam_reject = seen
+                if key not in seen:
+                    seen.add(key)
+                    turn = getattr(state, "next_turn_dir", None)
+                    adeg = float(getattr(state, "turn_deg", 0.0) or 0.0)
+                    # причина “не хватает дороги на стороне поворота”
+                    need_side = None
+                    if turn == "left":
+                        need_side = "left"
+                    elif turn == "right":
+                        need_side = "right"
+
+                    # сформируем текст причины
+                    details = f"lf={lf:.2f} cf={cf:.2f} rf={rf:.2f} thr={thr:.2f} side_thr={side_thr:.2f} center_min={center_min:.2f}"
+                    if need_side == "left" and not has_left:
+                        _diag_missed("cam_reject_not_enough_left_road", details)
+                    elif need_side == "right" and not has_right:
+                        _diag_missed("cam_reject_not_enough_right_road", details)
+                    elif not has_center:
+                        _diag_missed("cam_reject_no_center_road", details)
+                    else:
+                        _diag_missed("cam_reject", details)
         return
-    print(f"[CAM JUNC] камера видит развилку: lf={lf:.3f} cf={cf:.3f} rf={rf:.3f}", flush=True)
-    # 3) если маска говорит "есть развилка", притягиваем robot_px
-    #    к ближайшему по маршруту junction
-    rx, ry = robot
-    best = None  # (dist_px, jx, jy, ji)
 
-    # вспомогательная: индекс точки маршрута, ближайшей к (jx,jy)
-    def _nearest_idx_on_route(jx, jy):
-        best_i = 0
-        best_d2 = float("inf")
-        for i, (x, y) in enumerate(poly_px):
-            d2 = (x - jx)**2 + (y - jy)**2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_i = i
-        return best_i, best_d2
+    # камера ВИДИТ перекрёсток
+    state.cam_junc_seen = True
+    state.cam_junc_seen_ts = now
 
-    for (jx, jy) in juncs:
-        ji, d2 = _nearest_idx_on_route(jx, jy)
-        # немного ограничим по пиксельной дистанции, чтобы не прыгнуть слишком далеко
-        if d2 > (80.0 * 80.0):  # ~1 м при 80 px/м
+    # важно для road-follow gating
+    state._cam_junc_last_seen_ts = now
+    state._cam_junc_seen_lr = (bool(has_left), bool(has_right), bool(has_center))
+
+    # debug (как у тебя)
+    state.fturn_l = lf
+    state.fturn_c = cf
+    state.fturn_r = rf
+
+    # ------------------------------------------------------------
+    # D) берём junction-projection из turn-hint (та же база 10 перекрёстков)
+    # ------------------------------------------------------------
+    proj = getattr(state, "_junc_proj", None) or []
+    # ожидаемый формат: (s_m, seg_i, t, j_id, dist_px)
+    if not proj:
+        # если кэш ещё не построен — снап НЕ делаем
+        return
+
+    # ------------------------------------------------------------
+    # E) выбираем целевой перекрёсток в окне по маршруту (и впереди, и сзади)
+    # ------------------------------------------------------------
+    lo = done - float(search_behind_m)
+    hi = done + float(search_ahead_m)
+
+    best = None  # (abs_delta, delta, s_junc, seg_i, t, j_id, dist_px)
+    for (s_junc, seg_i, t, j_id, dist_px) in proj:
+        s_junc = float(s_junc)
+        if s_junc < lo or s_junc > hi:
             continue
-        if best is None or d2 < best[0]:
-            best = (d2, jx, jy, ji)
+
+        delta = s_junc - done
+        abs_delta = abs(delta)
+
+        if abs_delta < float(min_abs_delta_m) or abs_delta > float(max_abs_delta_m):
+            continue
+
+        if best is None or abs_delta < best[0]:
+            best = (abs_delta, delta, s_junc, int(seg_i), float(t), int(j_id), float(dist_px))
 
     if best is None:
         return
 
-    _, jx, jy, ji = best
+    _, delta, s_junc, seg_i, t, j_id, dist_px = best
 
-    # 4) пересчёт пройденного пути до этого индекса
+    # ------------------------------------------------------------
+    # F) не повторяем снап на тот же перекрёсток
+    # ------------------------------------------------------------
+    last_j = getattr(state, "_last_cam_snap_j_id", None)
+    if last_j is not None and int(last_j) == int(j_id):
+        return
+
+    # ------------------------------------------------------------
+    # G) target_done = s_junc - snap_before_m (ДО перекрёстка)
+    # ------------------------------------------------------------
+    cum_m = [0.0]
+    total = 0.0
+    for a, b in zip(poly_m, poly_m[1:]):
+        total += math.hypot(b[0] - a[0], b[1] - a[1])
+        cum_m.append(total)
+
+    target_done = float(s_junc) - float(snap_before_m)
+    target_done = max(0.0, min(float(cum_m[-1]), target_done))
+
+    if abs(target_done - done) < float(min_move_m):
+        return
+
+    # ------------------------------------------------------------
+    # H) интерполируем robot_px по target_done
+    # ------------------------------------------------------------
+    k = bisect.bisect_right(cum_m, target_done) - 1
+    k = max(0, min(len(cum_m) - 2, k))
+
+    seg_len = max(1e-9, float(cum_m[k + 1]) - float(cum_m[k]))
+    tt = (target_done - float(cum_m[k])) / seg_len
+
+    ax, ay = poly_px[k]
+    bx, by = poly_px[k + 1]
+    x = float(ax + tt * (bx - ax))
+    y = float(ay + tt * (by - ay))
+
+    # ------------------------------------------------------------
+    # I) применяем snap
+    # ------------------------------------------------------------
+    state.robot_px = (x, y)
+    state.route_done_m = float(target_done)
+    state.route_progress_idx = int(k)
+
+    state._last_cam_snap_j_id = int(j_id)
+    state._last_cam_snap_ts = now
+
+    print(
+        f"[CAM SNAP] j_id={j_id}  delta={delta:+.1f}m  target_done={target_done:.1f}m  "
+        f"s_junc={s_junc:.1f}m  dist_px={dist_px:.1f}  "
+        f"lf={lf:.2f} cf={cf:.2f} rf={rf:.2f}",
+        flush=True
+    )
+
+
+def update_junction_turn_hint(
+    state,
+    announce_dist_m: float = 9.0,
+    eps_px: float = 11.0,
+    straight_deg: float = 9.2,
+    sample_before_m: float = 5.0,
+    sample_after_m: float = 5.0,
+    pass_margin_m: float = 0.50,
+    backtrack_reset_m: float = 1.0,   # если done уменьшился > 1м — считаем, что поехали "назад", можно объявлять заново
+) -> None:
+    """
+    Обновляет:
+      state.jdist, state._junc_idx, state.next_turn_dir
+      state.fturn — 1 раз на junction (на текущей "сессии движения")
+    """
+
+    import time, math, bisect
+    now = time.monotonic()
+
+    poly_px = getattr(state, "route_pts_px", None) or []
+    poly_m  = getattr(state, "route_pts_m",  None) or []
+    junctions = getattr(state, "junctions_px", None) or []
+
+    # базовые сбросы
+    state.jdist = None
+    state._junc_idx = None
+    state.next_turn_dir = None
+
+    if len(poly_px) < 3 or len(poly_px) != len(poly_m) or not junctions:
+        return
+
+    # ---------------------------
+    # СЕССИЯ ДВИЖЕНИЯ / АНТИДРЕБЕЗГ
+    # ---------------------------
+    is_running = bool(getattr(state, "is_running", False))
+    prev_running = bool(getattr(state, "_turn_prev_running", False))
+    state._turn_prev_running = is_running
+
+    # старт новой "сессии" когда is_running: False -> True
+    if is_running and not prev_running:
+        state._turn_session_id = int(getattr(state, "_turn_session_id", 0) or 0) + 1
+        state._announced_junc_ids = set()
+        state._turn_last_done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
+
+    # если не едем — можно не спамить вычислениями (по желанию)
+    # но оставим расчёт next_turn_dir/jdist даже на паузе — иногда это удобно
+    done = float(getattr(state, "route_done_m", 0.0) or 0.0)
+
+    # backtrack: если done заметно уменьшился — разрешаем объявлять заново
+    last_done = float(getattr(state, "_turn_last_done_m", done) or done)
+    if done < last_done - float(backtrack_reset_m):
+        state._announced_junc_ids = set()
+    state._turn_last_done_m = done
+
+    # ---- timeout fturn (как у тебя) ----
+    ft = getattr(state, "fturn", None)
+    ft_ts = getattr(state, "_fturn_ts", None)
+    if ft is not None and ft_ts is not None:
+        if (now - float(ft_ts)) > 10.0:
+            state.fturn = None
+            state._fturn_ts = None
+
+    # ---------------------------
+    # cumlen (в метрах вдоль маршрута)
+    # ---------------------------
     def _cumlen(points):
         acc = [0.0]
-        total = 0.0
         for a, b in zip(points, points[1:]):
-            d = math.hypot(b[0]-a[0], b[1]-a[1])
-            total += d
-            acc.append(total)
+            acc.append(acc[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
         return acc
 
     cum_m = _cumlen(poly_m)
-    if 0 <= ji < len(cum_m):
-        new_done = float(cum_m[ji])
-    else:
+    total_m = float(cum_m[-1] if cum_m else 0.0)
+    if total_m <= 1e-6:
         return
 
-    # 5) аккуратно обновляем state
-    state.robot_px = (float(jx), float(jy))
-    state.route_done_m = new_done
+    # ---------------------------
+    # helper: точка на полилинии по s (интерполяция в PX)
+    # ---------------------------
+    def point_px_at_s(target_s: float):
+        target_s = max(0.0, min(float(target_s), total_m))
+        i = bisect.bisect_right(cum_m, target_s) - 1
+        i = max(0, min(i, len(cum_m) - 2))
+        s0 = cum_m[i]
+        s1 = cum_m[i + 1]
+        seg = max(1e-9, s1 - s0)
+        t = (target_s - s0) / seg
+        ax, ay = poly_px[i]
+        bx, by = poly_px[i + 1]
+        return (ax + t * (bx - ax), ay + t * (by - ay)), i, t
 
-    print(
-        f"[CAM SNAP] перекрёсток детектирован по камере → "
-        f"snap robot_px -> ({jx:.1f},{jy:.1f}), route_done_m={new_done:.2f}",
-        flush=True,
-    )
+    # ---------------------------
+    # 1) КЕШ проекций junction -> s_m вдоль маршрута
+    # ---------------------------
+    def _seg_len(a, b):
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    def _point_to_segment_proj_px(a_px, b_px, p_px):
+        ax, ay = a_px
+        bx, by = b_px
+        px, py = p_px
+        vx, vy = bx - ax, by - ay
+        wx, wy = px - ax, py - ay
+        vv = vx * vx + vy * vy
+        if vv <= 1e-12:
+            t = 0.0
+            qx, qy = ax, ay
+        else:
+            t = (wx * vx + wy * vy) / vv
+            if t < 0.0: t = 0.0
+            elif t > 1.0: t = 1.0
+            qx, qy = ax + t * vx, ay + t * vy
+        dist_px = _seg_len((px, py), (qx, qy))
+        return dist_px, t, (qx, qy)
+
+    cache_key = (len(poly_px), round(total_m, 3), len(junctions), round(float(eps_px), 3))
+    if getattr(state, "_junc_cache_key", None) != cache_key or not hasattr(state, "_junc_proj"):
+        proj = []
+        for j_idx, j in enumerate(junctions):
+            pt_px = (float(j[0]), float(j[1]))
+
+            best = (float("inf"), None, 0.0)  # dist_px, seg_i, t
+            for i, (a_px, b_px) in enumerate(zip(poly_px, poly_px[1:])):
+                dist_px, t, _ = _point_to_segment_proj_px(a_px, b_px, pt_px)
+                if dist_px < best[0]:
+                    best = (dist_px, i, t)
+
+            dist_px, i, t = best
+            if i is None:
+                continue
+            if dist_px > float(eps_px):
+                continue
+
+            seg_len_m = math.hypot(
+                poly_m[i+1][0] - poly_m[i][0],
+                poly_m[i+1][1] - poly_m[i][1],
+            )
+            s_m = cum_m[i] + t * seg_len_m
+
+            proj.append((float(s_m), int(i), float(t), int(j_idx), float(dist_px)))
+
+        proj.sort(key=lambda x: x[0])
+        state._junc_proj = proj
+        state._junc_cache_key = cache_key
+
+    proj = getattr(state, "_junc_proj", []) or []
+    if not proj:
+        return
+
+    # ---------------------------
+    # 2) ближайший junction ВПЕРЁД
+    # ---------------------------
+    s_list = [p[0] for p in proj]
+    k = bisect.bisect_right(s_list, done + float(pass_margin_m))
+    if k >= len(proj):
+        return
+
+    s_j, best_i, best_t, j_idx, dist_px = proj[k]
+    jdist = s_j - done
+    if jdist <= 0.0:
+        return
+
+    state.jdist = float(jdist)
+    state._junc_idx = int(best_i)
+
+    # ---------------------------
+    # 3) направление по КУРСАМ (atan2) + интерполяция точек по s
+    # ---------------------------
+    s0 = s_j - float(sample_before_m)
+    s2 = s_j + float(sample_after_m)
+
+    p0, _, _ = point_px_at_s(s0)
+    p1, _, _ = point_px_at_s(s_j)
+    p2, _, _ = point_px_at_s(s2)
+
+    # heading в "мат. координатах": y вверх => dy_screen инвертируем
+    def heading(p_from, p_to):
+        dx = float(p_to[0] - p_from[0])
+        dy = float(p_to[1] - p_from[1])
+        return math.atan2(-dy, dx)
+
+    h1 = heading(p0, p1)
+    h2 = heading(p1, p2)
+
+    # wrap to [-pi, pi]
+    d = h2 - h1
+    while d > math.pi:  d -= 2.0 * math.pi
+    while d < -math.pi: d += 2.0 * math.pi
+
+    d_deg = math.degrees(d)
+    state.turn_deg = d_deg
+    if abs(d_deg) <= float(straight_deg):
+        turn = "straight"
+    else:
+        turn = "left" if d_deg > 0 else "right"
+
+    state.next_turn_dir = turn
+    if int(j_idx) == 9 and turn == "straight":
+        turn = "left"
+        state.next_turn_dir = "left"
+    # ---------------------------
+    # 4) триггер 1 раз на junction за сессию движения (но можно повторно после backtrack/reset)
+    # ---------------------------
+    if state.jdist <= float(announce_dist_m):
+        announced = getattr(state, "_announced_junc_ids", None)
+        if not isinstance(announced, set):
+            announced = set()
+            state._announced_junc_ids = announced
+
+        j_id = int(j_idx)  # твои "10 точек" => стабильный id = индекс в junctions_px
+
+        if j_id not in announced:
+            announced.add(j_id)
+            state.fturn = turn
+            state._fturn_ts = now
+            state._active_turn_j_id = j_id
+            state._active_turn_s_m  = s_j   # ВАЖНО: это абсолют по маршруту
+            #print(f"[TURN HINT] {s_j} = s_j",flush=True)
+            # лаконичный лог факта
+            print(
+                f"[TURN HINT] {turn}  j_id={j_id}  jdist={state.jdist:.1f}m  d={d_deg:.1f}deg  dist_px={dist_px:.1f}",
+                flush=True
+            )

@@ -8,7 +8,7 @@ from state import AppState
 from page_idle import IdlePage
 from page_drive import DrivePage
 from routing import refresh_all_overlays
-
+from graphics import show_map_on_views
 import logging
 logging.disable(logging.NOTSET)
 
@@ -24,10 +24,6 @@ class Main(QtWidgets.QMainWindow):
 
         uic.loadUi(UI_PATH, self)
         self.setWindowTitle("Platform GUI")
-
-
-
-        # глобальное состояние
         self.state = AppState()
 
         # базовые ссылки на ключевые виджеты/страницы
@@ -107,8 +103,8 @@ class Main(QtWidgets.QMainWindow):
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Сначала Стоп → затем карта.")
             return
         self.pick_map_and_load()
-    # --- НОВОЕ: утилиты диагностики и безопасного сброса ---
 
+    # --- НОВОЕ: утилиты диагностики и безопасного сброса ---
 
     def _hard_stop_animation(self):
         """Полный стоп анимации: остановить таймер и обнулить ссылку, чтобы не тикал по удалённым QGraphicsItem."""
@@ -223,7 +219,6 @@ class Main(QtWidgets.QMainWindow):
             pass
 
         # показать карту в обеих сценах
-        from graphics import show_map_on_views
         idle_view  = self.findChild(QtWidgets.QGraphicsView, "mapViewIdle")
         drive_view = self.findChild(QtWidgets.QGraphicsView, "mapViewDrive")
         try:
@@ -239,7 +234,6 @@ class Main(QtWidgets.QMainWindow):
         except Exception as e:
             print("[MAP] load_graph_and_points_for error:", e, flush=True)
         from routing import refresh_all_overlays
-        refresh_all_overlays(state, ui.viewIdle, ui.viewDrive)
         # перерисовать оверлеи
         try:
             refresh_all_overlays(self.state, idle_view, drive_view)
@@ -255,13 +249,7 @@ class Main(QtWidgets.QMainWindow):
                 btn.setText("Пуск")
         except Exception:
             pass
-        
-        # После загрузки карты обновляем карту/имя и дергаем RoadSeg под текущую карту
-        try:
-            if hasattr(self, "drive") and self.drive is not None:
-                self.drive._reload_seg_for_current_map()
-        except Exception as e:
-            print("[SEG] reload on new map error:", e, flush=True)
+    
 
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -273,10 +261,9 @@ def main():
 
     w = Main()
     w.setWindowFlags(QtCore.Qt.FramelessWindowHint)
-    w.setGeometry(0, 0, 1200, 800)     # заполняем экран полностью
+    w.setGeometry(0, 0, 1920, 1200)     # заполняем экран полностью
     w.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()

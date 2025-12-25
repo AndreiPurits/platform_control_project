@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>420</width>
-    <height>380</height>
+    <width>720</width>
+    <height>600</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -31,7 +31,6 @@
      </property>
     </widget>
    </item>
-   <!-- Блок управления скоростью / PWM -->
    <item>
     <layout class="QHBoxLayout" name="pwmLayout">
      <item>
@@ -94,7 +93,6 @@
      </item>
     </layout>
    </item>
-   <!-- Кнопки направления, как на джойстике -->
    <item>
     <layout class="QGridLayout" name="gridLayout">
      <item row="0" column="1">
@@ -162,7 +160,6 @@
        </property>
       </widget>
      </item>
-     <!-- Диагонали, если захочешь использовать -->
      <item row="0" column="0">
       <widget class="QPushButton" name="btnManFwdLeft">
        <property name="minimumSize">

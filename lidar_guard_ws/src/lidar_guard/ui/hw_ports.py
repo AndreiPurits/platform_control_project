@@ -11,12 +11,6 @@ hw_ports.py — централизованная конфигурация пос
 import os
 import glob
 
-# Можно задать через переменные среды:
-#   ROVER_ARDUINO_PORT=/dev/ttyACM0
-#   ROVER_LIDAR_FRONT=/dev/ttyUSB0
-#   ROVER_LIDAR_REAR=/dev/ttyUSB1
-
-
 def _resolve_symlink(path: str) -> str:
     try:
         return os.path.realpath(path)
@@ -24,40 +18,14 @@ def _resolve_symlink(path: str) -> str:
         return path
 
 
-def get_arduino_port() -> str | None:
+def get_arduino_port():
     """
-    Порт Arduino (Nano/Mega/Uno), по которому идут команды L/R/B.
-    Лидары сюда попадать НЕ должны.
+    Возвращаем ЖЁСТКО фиксированный порт для Arduino — /dev/ttyUSB0.
     """
-    # 0) Явный override через env
-    env_port = os.environ.get("ROVER_ARDUINO_PORT")
-    if env_port:
-        return env_port
-
-    # 1) Спец-симлинк, если настроишь udev
-    if os.path.exists("/dev/mega"):
-        return "/dev/mega"
-
-    # 2) /dev/serial/by-id — отфильтровать Silicon Labs (лидар) и оставить Arduino/CH340
-    by_id = sorted(glob.glob("/dev/serial/by-id/*"))
-    if by_id:
-        for p in by_id:
-            name = os.path.basename(p).lower()
-            # игнорируем CP210x / Silicon Labs (лидары)
-            if "silicon_labs" in name or "cp210" in name:
-                continue
-            # ищем что-то похожее на Arduino
-            if any(k in name for k in ("arduino", "ch340", "wch", "mega", "uno", "nano")):
-                return _resolve_symlink(p)
-
-    # 3) ttyACM* — чаще всего CDC (Uno/Mega)
-    acm = sorted(glob.glob("/dev/ttyACM*"))
-    if acm:
-        return acm[0]
-
-    # 4) НЕ лезем в ttyUSB* вслепую, чтобы не поймать лидар
+    cand = "/dev/ttyUSB0"
+    if os.path.exists(cand):
+        return cand
     return None
-
 
 def get_lidar_front_port() -> str | None:
     """

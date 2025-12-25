@@ -10,32 +10,36 @@ class AppState:
         self.graph = None
         self.points_px = None
         self.meters_per_pixel = None
-        self.m_per_px_x = 0.0
-        self.m_per_px_y = 0.0
+        self.m_per_px_x = 0.8342405111938622
+        self.m_per_px_y = 1.2604320351524956
         self.robot_px = None
         self.goal_px  = None
-
+        self.route_goal_px = []
         self.route_pts_px = []
         self.route_pts_m = []
-
+        self._junc_s_m = None
         self.route_len_m  = 0.0
         self.route_len_px = 0.0
         self.route_done_m = 0.0
         self.junctions_px = []
-
+        self.drive_pwm_us = 1700
         self.jdist = None
         self.next_turn_dir = None
         self.route_contr_m = 0.0
 
         self.route_cum_px = []
 
+        # --- РЕЖИМ ТРАЕКТОРИИ ---
+        self.trajectory_mode: bool = False   # едем по вручную заданной траектории
+        self.traj_idx: int = 0               # текущий сегмент (route_pts_px[traj_idx] -> route_pts_px[traj_idx+1])
+        self.traj_seg_heading_rad: float = 0.0  # опорный угол текущего сегмента
+        self.traj_wp_radius_m: float = 0.2     # радиус "достижения" точки, м
 
         self.speed_mps = 0.0
         self.spline_polyline: Optional[List[Tuple[float, float]]] = None
 
         self.robot_idx: Optional[int] = None   # белый флаг (позиция робота)
         self.goal_idx: Optional[int]  = None   # красный флаг (контрольная точка)
-        self.control_pts_px: list[tuple[float, float]] = []
 
         self.manual_loc_mode: bool = False       # IDLE: режим «поставить флаг»
         self.select_goal_mode_idle: bool = False # IDLE: режим «выбора цели»
@@ -44,6 +48,14 @@ class AppState:
         self.loc_mode_idle: bool = False 
         self.loc_mode_drive: bool = False 
 
+        self.b_pwm = 1500          # текущее значение 3-го выхода
+        self.b_on_pwm = 2000       # "включить" (например, 2000 мкс)
+        self.b_off_pwm = 1500      # "выключить" (нейтраль)
+        self.kr_b_next_on = True   # следующий флажок КР будет ON, потом OFF и т.д.
+
+        # КР: точки + тип (для цвета и логики B)
+        self.control_pts_px: list[tuple[float, float]] = []
+        self.control_pts_kind: list[str] = []   # "b_on" / "b_off"
 
         # LIDAR
 
@@ -93,7 +105,7 @@ class AppState:
         self.lidar_front_stop_distance_m   = 2.0
         self.lidar_front_ignore_radius_m   = 0.7
         self.lidar_front_stop_min_points   = 3
-        self.lidar_front_mount_yaw_rad     = 0.0
+        self.lidar_front_mount_yaw_rad     = 3.14
 
         # ЗАДНИЙ лидар (смотрит назад)
         self.lidar_rear_sector_half_deg    = 25.0
@@ -102,7 +114,7 @@ class AppState:
         self.lidar_rear_stop_min_points    = 3
         self.lidar_rear_mount_yaw_rad      = 0.0  
 
-        self.pwm_base_us = 1700
+        self.pwm_base_us = 1750
         self.har_rear_lidar = False
 
         # «зелёный трек» — постоянный
@@ -164,3 +176,25 @@ class AppState:
         self.manual_l_pwm = 0
         self.manual_r_pwm = 0
         self.manual_b_pwm = 0
+
+        self.manual_drive = None
+        self.lane_center_px = None
+        self.lane_offset_px = None
+        self.lane_offset_ema_px = None
+        self.lane_left_px = None
+        self.lane_right_px = None
+        self.lane_last_ok = None
+        self.lane_junction_candidate = False
+
+        self.robot_yaw_rad = 0
+        self.traj_current_yaw = 0 
+
+        self.fturn = ""
+        self.fturn_l = 0.0
+        self.fturn_c = 0.0
+        self.fturn_r = 0.0
+        self._last_snap_jxy = None
+
+        self.turn_deg = 0
+        self._active_turn_s_m = 0
+        self._active_turn_j_id = 0

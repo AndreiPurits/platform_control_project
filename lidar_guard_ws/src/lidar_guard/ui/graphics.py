@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 from typing import List, Tuple, Optional
 from PyQt5 import QtWidgets, QtGui, QtCore
-from robot_cmd import tool_pulse
+from robot_cmd import set_safety_stop, get_speed
+from status import set_indicator
 import math
 import os, json, time
+import cv2  
 
 Point = Tuple[float, float]
 
@@ -183,14 +185,14 @@ def draw_goal_marker(scene: QtWidgets.QGraphicsScene,
     return item
 
 
-def draw_flag(scene: QtWidgets.QGraphicsScene, pos_px, color="#1e88e5"):
+def draw_flag(scene: QtWidgets.QGraphicsScene, pos_px, color=str):
     if not scene or not pos_px:
         return None
     pen = QtGui.QPen(QtGui.QColor(color))
     pen.setWidth(2)
     pen.setCosmetic(True)
     brush = QtGui.QBrush(QtGui.QColor(color))
-    size = 12
+    size = 16
     poly = QtGui.QPolygonF([
         QtCore.QPointF(0, -size),
         QtCore.QPointF(size * 0.7, -size * 0.4),
@@ -201,26 +203,36 @@ def draw_flag(scene: QtWidgets.QGraphicsScene, pos_px, color="#1e88e5"):
     item.setZValue(100)
     return item
 
-
 # ---------- флаги / столкновение ----------
-def check_flag_collision_and_update(state,
-                                    eps_px: float = 4.0,
-                                    ui: Optional[QtWidgets.QMainWindow] = None):
+
+def check_flag_collision_and_update(
+    state,
+    eps_px: float = 8.0,
+    ui: Optional[QtWidgets.QMainWindow] = None,
+):
     rp = getattr(state, "robot_px", None)
     if not rp:
         return
 
     rx, ry = float(rp[0]), float(rp[1])
+
     flags = list(getattr(state, "control_pts_px", []))
-    kept = []
-    removed_any = False
+    kinds = list(getattr(state, "control_pts_kind", []))
+
+    if not flags:
+        return
 
     heading = float(getattr(state, "robot_heading_rad", 0.0) or 0.0)
     cos_h, sin_h = math.cos(heading), math.sin(heading)
+
     front_boost = 1.4
     back_cutoff = 0.7
 
-    for pt in flags:
+    best_idx = None
+    best_dist2 = None
+
+    # --- ищем ОДИН ближайший флаг в радиусе ---
+    for i, pt in enumerate(flags):
         px, py = float(pt[0]), float(pt[1])
         dx = px - rx
         dy = py - ry
@@ -233,40 +245,148 @@ def check_flag_collision_and_update(state,
             r2 = (eps_px * back_cutoff) ** 2
 
         if dist2 <= r2:
-            print(f"[FLAG] reached ~ε={eps_px}px (adj) {pt} -> ВЫХОД 3", flush=True)
-            removed_any = True
-            try:
-                if ui is not None and hasattr(ui, "_dump_state"):
-                    ui._dump_state(f"after FLAG REMOVED at {pt}")
-            except Exception as e:
-                print("[FLAG] dump_state error:", e, flush=True)
-            continue
+            if best_idx is None or dist2 < best_dist2:
+                best_idx = i
+                best_dist2 = dist2
 
-        kept.append(pt)
+    if best_idx is None:
+        return  # ни один флаг не зацепили
 
-    if removed_any:
-        state.control_pts_px = kept
-        # ВАЖНО: пинаем вспомогательный канал в 2000 мкс на 200 мс
-        tool_pulse(ui, state, level_us=2000, ms=200)
-        for sc in (getattr(state, "_idle_scene", None),
-                   getattr(state, "_drive_scene", None)):
+    # --- сработал один флажок ---
+    pt = flags[best_idx]
+    kind = kinds[best_idx] if best_idx < len(kinds) else None
+    print(f"[FLAG] reached #{best_idx} {pt} kind={kind!r}", flush=True)
+
+    # Удаляем точку и её цвет по одному и тому же индексу
+    del flags[best_idx]
+    if best_idx < len(kinds):
+        del kinds[best_idx]
+
+    state.control_pts_px = flags
+    state.control_pts_kind = kinds
+
+    # --- вычисляем PWM для B ---
+    if kind == "b_on":
+        b_pwm = int(getattr(state, "b_on_pwm", 2000) or 2000)
+    elif kind == "b_off":
+        b_pwm = int(getattr(state, "b_off_pwm", 1500) or 1500)
+    else:
+        # если вдруг kind нет, оставляем текущее значение
+        b_pwm = int(getattr(state, "b_pwm", 1500) or 1500)
+
+    l = int(getattr(state, "l_pwm", 1500) or 1500)
+    r = int(getattr(state, "r_pwm", 1500) or 1500)
+    state.b_pwm = b_pwm
+
+    try:
+        from robot_cmd import motors_set
+        motors_set(state, l, r, b_pwm)
+        print(f"[FLAG] apply B={b_pwm} (L={l}, R={r})", flush=True)
+    except Exception as e:
+        print("[FLAG] motors_set B error:", e, flush=True)
+
+    # Перерисовать маркеры, чтобы один флаг исчез, остальные остались со своими цветами
+    try:
+        from graphics import redraw_markers
+    except Exception:
+        redraw_markers = None
+
+    if redraw_markers:
+        for sc in (
+            getattr(state, "_idle_scene", None),
+            getattr(state, "_drive_scene", None),
+        ):
             if sc is not None:
                 try:
                     redraw_markers(state, sc)
                 except Exception:
                     pass
 
+    if ui is not None and ui.statusBar():
+        ui.statusBar().showMessage("Сработал флажок КР", 1200)
 
 def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
+    """
+    Перерисовка маркеров (робот, цель, КР-флажки) для IDLE и DRIVE.
+
+    ВАЖНО:
+      - Цвет флажков КР берём ТОЛЬКО из state.control_pts_kind.
+      - После старта движения (is_running/trajectory_mode) НИКОГДА
+        не пересчитываем цвета, только отображаем то, что уже записано.
+    """
+    ctrl_pts = list(getattr(state, "control_pts_px", []) or [])
+    kinds    = list(getattr(state, "control_pts_kind", []) or [])
+
+    running = bool(getattr(state, "is_running", False)) or bool(
+        getattr(state, "trajectory_mode", False)
+    )
+
+    # --- РЕДАКТОРСКАЯ ФАЗА (до старта движения) ---
+    # Тут разрешаем автозаполнение kinds в стиле: зелёный, красный, зелёный, красный...
+    if not running:
+        if not kinds and ctrl_pts:
+            # если ещё нет kinds, создаём с чередованием
+            kinds = []
+            next_on = True  # первый всегда b_on (зелёный)
+            for _ in ctrl_pts:
+                kinds.append("b_on" if next_on else "b_off")
+                next_on = not next_on
+            state.control_pts_kind = kinds
+        else:
+            # Длины немного расъехались — аккуратно добиваем хвост (в редакторском режиме это ок)
+            if len(kinds) < len(ctrl_pts):
+                # продолжаем чередование от последнего известного состояния
+                if kinds:
+                    last = kinds[-1]
+                    next_on = (last != "b_on")
+                else:
+                    next_on = True
+                for _ in range(len(ctrl_pts) - len(kinds)):
+                    kinds.append("b_on" if next_on else "b_off")
+                    next_on = not next_on
+                state.control_pts_kind = kinds
+            elif len(kinds) > len(ctrl_pts):
+                # обрезаем лишние, если вдруг есть
+                kinds = kinds[:len(ctrl_pts)]
+                state.control_pts_kind = kinds
+
+    # --- ФАЗА ДВИЖЕНИЯ ---
+    # Здесь НИЧЕГО не пересчитываем для цветов.
+    # Единственное, что допустимо — длина kinds не должна быть больше, чем точек.
+    else:
+        if len(kinds) > len(ctrl_pts):
+            kinds = kinds[:len(ctrl_pts)]
+            state.control_pts_kind = kinds
+
+    def _color_for_idx(i: int) -> str:
+        kind = None
+        if 0 <= i < len(state.control_pts_kind or []):
+            kind = state.control_pts_kind[i]
+
+        if kind == "b_off":
+            return "#e53935"  # красный — выключение B (1500)
+        elif kind == "b_on":
+            return "#43a047"  # зелёный — включение B (2000)
+        else:
+            return "#1e88e5"  # синий — дефолт (если вдруг нет информации)
+
+    # ---------- IDLE-СЦЕНА ----------
     if scene is getattr(state, "_idle_scene", None):
+        # Робот
         state.idle_robot_item = draw_robot_dot(
-            scene, getattr(state, "idle_robot_item", None),
-            getattr(state, "robot_px", None)
+            scene,
+            getattr(state, "idle_robot_item", None),
+            getattr(state, "robot_px", None),
         )
+
+        # Цель
         state.idle_goal_item = draw_goal_marker(
-            scene, getattr(state, "idle_goal_item", None),
-            getattr(state, "goal_px", None)
+            scene,
+            getattr(state, "idle_goal_item", None),
+            getattr(state, "goal_px", None),
         )
+
+        # КР-флажки: удалить старые
         for it in getattr(state, "idle_control_items", []):
             try:
                 if it and it.scene() is scene:
@@ -274,20 +394,31 @@ def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
             except Exception:
                 pass
         state.idle_control_items = []
-        for pt in getattr(state, "control_pts_px", []):
-            it = draw_flag(scene, pt, color="#1e88e5")
+
+        # Нарисовать заново с закреплёнными цветами
+        for i, pt in enumerate(ctrl_pts):
+            color = _color_for_idx(i)
+            it = draw_flag(scene, pt, color=color)
             if it:
                 state.idle_control_items.append(it)
 
+    # ---------- DRIVE-СЦЕНА ----------
     elif scene is getattr(state, "_drive_scene", None):
+        # Робот
         state.drive_robot_item = draw_robot_dot(
-            scene, getattr(state, "drive_robot_item", None),
-            getattr(state, "robot_px", None)
+            scene,
+            getattr(state, "drive_robot_item", None),
+            getattr(state, "robot_px", None),
         )
+
+        # Цель
         state.drive_goal_item = draw_goal_marker(
-            scene, getattr(state, "drive_goal_item", None),
-            getattr(state, "goal_px", None)
+            scene,
+            getattr(state, "drive_goal_item", None),
+            getattr(state, "goal_px", None),
         )
+
+        # КР-флажки: удалить старые
         for it in getattr(state, "drive_control_items", []):
             try:
                 if it and it.scene() is scene:
@@ -295,11 +426,13 @@ def redraw_markers(state, scene: QtWidgets.QGraphicsScene):
             except Exception:
                 pass
         state.drive_control_items = []
-        for pt in getattr(state, "control_pts_px", []):
-            it = draw_flag(scene, pt, color="#1e88e5")
+
+        # Нарисовать заново
+        for i, pt in enumerate(ctrl_pts):
+            color = _color_for_idx(i)
+            it = draw_flag(scene, pt, color=color)
             if it:
                 state.drive_control_items.append(it)
-
 
 def redraw_radar_points(scene: QtWidgets.QGraphicsScene,
                         pts_m,
@@ -374,17 +507,16 @@ def _lidar_check(pts, half_deg, R, Rmin, need_n, yaw0_rad) -> bool:
             break
 
     return near_cnt >= need_n
+
 def lidar_front_stop(ui, state) -> bool:
-
     pts = getattr(state, "_lidar_front_last_pts", None) or []
-
     stop = _lidar_check(
         pts=pts,
         half_deg=float(getattr(state, "lidar_front_sector_half_deg", 15.0) or 15.0),
         R=float(getattr(state, "lidar_front_stop_distance_m", 2.0) or 2.0),
         Rmin=float(getattr(state, "lidar_front_ignore_radius_m", 0.7) or 0.7),
-        need_n=int(getattr(state, "lidar_front_stop_min_points", 3) or 3),
-        yaw0_rad=float(getattr(state, "lidar_front_mount_yaw_rad", 0.0) or 0.0),
+        need_n=int(getattr(state, "lidar_front_stop_min_points", 2) or 2),
+        yaw0_rad=float(getattr(state, "lidar_front_mount_yaw_rad", 3.14) or 3.14),
     )
 
     prev = bool(getattr(state, "safety_stop_front", False))
@@ -406,6 +538,7 @@ def lidar_front_stop(ui, state) -> bool:
         print("[LIDAR FRONT STOP] cleared", flush=True)
 
     return stop
+
 def lidar_rear_stop(ui, state) -> bool:
     # если заднего лидара нет — всегда зелёная лампа и нет стопа
     if not getattr(state, "has_rear_lidar", False):
@@ -495,12 +628,9 @@ def recompute_route_metrics(state):
 
 
 # --------- старт анимации маршрута (движение по метрам) ----------
-from PyQt5 import QtWidgets  # уже импортирован, но пусть будет явно
 
 
 def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
-    print(f"[CALIB] Lm={state.route_len_m:.3f} m  |  Lpx={state.route_len_px:.3f} px  |  alpha={state.alpha_m_per_px:.6f} m/px")
-    print(f"[STEP] done_m={state.route_done_m:.2f}/{state.route_len_m:.2f}  s_px={(state.route_done_m / max(1e-9, state.route_len_m)) * state.route_len_px:.1f}/{state.route_len_px:.1f}")
     pts = getattr(state, "route_pts_px", None) or []
     if len(pts) < 2 or float(getattr(state, "route_len_m", 0.0) or 0.0) <= 0.0:
         print("[ANIM] нет маршрута", flush=True)
@@ -602,6 +732,8 @@ def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
             if btn:
                 btn.setChecked(False)
                 btn.setText("Пуск")
+            from routing import clear_goals_and_route
+            clear_goals_and_route(state)
         else:
             i, x, y = _interp_by_s_px(s_px_new)
             state.route_progress_idx = i
@@ -716,8 +848,6 @@ def update_visited_track(ui, state, min_seg_px: float = 2.0):
 
 
 # ==== dataset capture (камера + лидар) ====
-import cv2  # вверху, но оставим
-
 
 def _dataset_dirs(state):
     map_path = getattr(state, "active_map_path", None) or "map"
@@ -749,7 +879,6 @@ def _save_camera_frame(state, x_px, y_px):
     except Exception as e:
         print("[CAMERA SAVE] error:", e, flush=True)
     return None
-
 
 def _ensure_dataset_dirs(state):
     root = getattr(state, "dataset_root", os.path.expanduser("~/datasets")) or os.path.expanduser("~/datasets")
@@ -887,9 +1016,6 @@ def dataset_maybe_capture(ui: QtWidgets.QMainWindow, state):
         state.dataset_last_snap_m = done
         print(f"[CAPTURE] done={done:.1f} m @ ({int(x_px)},{int(y_px)}) | " + ", ".join(saved_parts), flush=True)
 
-from robot_cmd import set_safety_stop, get_speed
-from status import set_indicator
-from PyQt5 import QtWidgets
 
 def _apply_combined_safety(ui, state):
     """
