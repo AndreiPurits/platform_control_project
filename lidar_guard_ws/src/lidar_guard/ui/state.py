@@ -62,8 +62,6 @@ class AppState:
         self.lidar_snap_enabled = False
         self.lidar_px_hint = None
         self.lidar_snap_step_px = 3.0
-        self.lidar_match = None        
-        self.safety_stop = False          # глобальный флаг STOP по лидару
         self._lidar_last_pts = []         # последние принятые точки лидара ([(x,y),...])
 
 
@@ -132,9 +130,6 @@ class AppState:
         self._cv2_cap = None              # handle cv2.VideoCapture
 
         # --- Dataset capture (унифицировано) ---
-        self.dataset_mode: bool = False           # вошли через «Датасет»
-        self.dataset_root: str = os.path.expanduser("~/datasets")
-        self.map_name: Optional[str] = None       # имя карты без .png (заполняем при pick_map_and_load)
         self.dataset_step_m: float = 3.0          # шаг сохранения, м
         self.dataset_last_snap_m: float = 0.0     # на каком пройденном метре последний снимок
 
@@ -143,10 +138,13 @@ class AppState:
         self.dataset_lidar_dir: Optional[str] = None
 
         # камера
-        self.cam_device = 0
-        self.cam_w = 1280
-        self.cam_h = 720
-        self.cam_fps = 30
+        self.cam_w_markers = 3840
+        self.cam_h_markers = 2160
+        self.cam_fps_markers = 30
+
+        self.cam_w_road = 1280
+        self.cam_h_road = 720
+        self.cam_fps_road = 30
         self._cam = None                  # cv2.VideoCapture
         self._cam_timer = None            # QtCore.QTimer
         self._last_cam_frame = None       # numpy ndarray BGR
@@ -163,7 +161,6 @@ class AppState:
         
         self.l_pwm = 0
         self.r_pwm = 0
-        self.b_pwm = 0
         self.yawrate_radps = 0.0
         
         self.road_frac = 0.0
@@ -177,7 +174,6 @@ class AppState:
         self.manual_r_pwm = 0
         self.manual_b_pwm = 0
 
-        self.manual_drive = None
         self.lane_center_px = None
         self.lane_offset_px = None
         self.lane_offset_ema_px = None
@@ -194,7 +190,99 @@ class AppState:
         self.fturn_c = 0.0
         self.fturn_r = 0.0
         self._last_snap_jxy = None
-
+        
         self.turn_deg = 0
         self._active_turn_s_m = 0
         self._active_turn_j_id = 0
+
+        self.main_road_fill_bgr = (0, 70, 0)   # темнее
+        self.rail_mask_update_s = 2.5          # обновление якорей раз в 2.5 сек
+        self.rail_mask_tau = 1.2               # сглаживание якорей по кадрам
+        self.rail_mask_hist_n = 5              # медиана по 5 обновлениям
+        self.rail_mask_bottom_saturated_thr = 0.98
+
+        self.rail_inset_px = 35
+        self.rail_head_soft = 0.25
+        self.rail_curv_soft = 0.20
+        self.rail_k_head_px = 0.012
+        self.rail_k_curv = 0.00030
+
+        self.mainline_bias_m = 6.0
+        self.mainline_exec_m = 2.0
+        self.mainline_bias_w = 0.25
+        self.mainline_follow_w = 1.0
+        self.mainline_post_turn_off_s = 1.0
+
+        self.cam_device = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1:1.0-video-index0"    
+        # или by-path (ещё стабильнее к порту):
+        # "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0"        
+        self.cam_open_timeout_s = 2.0
+        self.cam_reopen_cooldown_s = 0.4
+        self.force_mainline_only = True
+        self.mainline_follow_w = 1.0
+        self.mainline_bias_w = 0.15   # 0.15..0.25 ок
+
+        self.turn_execute = False
+        self.turn_allowed = False
+        self.turn_bias_allowed = False
+
+        self.turn_cam_L = False
+        self.turn_cam_R = False
+        self.turn_cam_C = False
+
+         # --- Marker-based driving (AruCo) ---
+        self.marker_mode: bool = True          # главный контур управления по знакам
+        self.marker_len_m: float = 0.178      
+
+        # last detection
+        self.marker_seen: bool = False
+        self.marker_id: int | None = None
+        self.marker_dist_m: float | None = None
+        self.marker_cx: float | None = None
+        self.marker_side: str | None = None   # "L" | "R"
+        self.marker_ts: float = 0.0
+
+        # turn state machine
+        self.marker_turn_active: bool = False
+        self.marker_turn_dir: str | None = None  # "left" | "right"
+        self.marker_turn_start_ts: float = 0.0
+        self.marker_turn_timeout_s: float = 1.6   # грубо, потом откалибруем
+        self.marker_drive_enabled = True
+
+        self.marker_target_side_m = 2.0     # держим 2 м от столба
+        self.marker_recent_s = 0.7          # сколько времени считаем "маркер ещё свежий"
+
+        self.marker_kp = 0.35                # усиление руления по боковой ошибке
+        self.marker_max_steer = 0.8
+
+        # runtime:
+        self.marker_last_ts = 0.0
+        self.marker_active = False
+        # --- ARUCO ids (final) ---
+        self.aruco_id_straight_right_pole = 10  # прямо по правому столбу (столб справа)
+        self.aruco_id_straight_left_pole  = 15  # прямо по левому столбу (столб слева)
+        self.aruco_id_turn_right          = 20  # поворот направо
+        self.aruco_id_turn_left           = 30  # поворот налево
+
+        # marker follow side: "right"|"left" (какой столб держим)
+        self.marker_follow_side: str = "right"
+        self.marker_tvec = None
+
+        self.marker_turn_trigger_m = 5.0
+        self.marker_steer_slew = 2.8
+        self.marker_approach_max_steer = 0.45
+        self.marker_approach_kp = 0.60
+        self.marker_approach_dead_m = 0.08
+        self.marker_approach_alpha = 0.25
+        
+        self.pwm_trim_lr = 2
+
+        self.rails_enabled: bool = False
+        self.road_model_path: str = ""
+
+        self.pole_spacing_m: int = 25 
+        self.manual_drive: bool = False
+        self.marker_pass_m: float = 1.2
+        # minimal time between two pole pass events (seconds)
+        self.marker_pass_cooldown_s: float = 0.8
+

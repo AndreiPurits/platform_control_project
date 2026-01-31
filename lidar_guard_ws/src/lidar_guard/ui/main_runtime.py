@@ -12,7 +12,10 @@ from graphics import show_map_on_views
 import logging
 logging.disable(logging.NOTSET)
 
-
+import faulthandler, sys
+faulthandler.enable(all_threads=True)
+sys.stderr.write("[FH] faulthandler enabled\n")
+sys.stderr.flush()
 UI_PATH = os.path.join(os.path.dirname(__file__), "main_window.ui")
 
 
@@ -34,18 +37,50 @@ class Main(QtWidgets.QMainWindow):
         if not self.stack or not self.pageIdle or not self.pageDrive:
             raise RuntimeError("Страницы stackRoot / pageIdle / pageDrive не найдены в UI.")
 
+        # --- ВАЖНО: вложить реальные UI страниц в контейнеры main_window.ui ---
+        # Здесь предполагается, что у тебя есть page_idle.ui и page_drive.ui рядом с main_window.ui
+        BASE_DIR = os.path.dirname(__file__)
+        IDLE_UI = os.path.join(BASE_DIR, "page_idle.ui")
+        DRIVE_UI = os.path.join(BASE_DIR, "page_drive.ui")
+
+        idle_layout: QtWidgets.QVBoxLayout = self.findChild(QtWidgets.QVBoxLayout, "pageIdleLayout")
+        drive_layout: QtWidgets.QVBoxLayout = self.findChild(QtWidgets.QVBoxLayout, "pageDriveLayout")
+        if idle_layout is None or drive_layout is None:
+            raise RuntimeError("pageIdleLayout / pageDriveLayout не найдены в main_window.ui")
+
+        # очистить контейнеры (на всякий случай)
+        while idle_layout.count():
+            it = idle_layout.takeAt(0)
+            w = it.widget()
+            if w:
+                w.setParent(None)
+
+        while drive_layout.count():
+            it = drive_layout.takeAt(0)
+            w = it.widget()
+            if w:
+                w.setParent(None)
+
+        # загрузить виджеты страниц и вставить
+        self.pageIdleWidget = uic.loadUi(IDLE_UI)
+        self.pageDriveWidget = uic.loadUi(DRIVE_UI)
+        idle_layout.addWidget(self.pageIdleWidget)
+        drive_layout.addWidget(self.pageDriveWidget)
         # инициализируем контроллеры страниц
         self.idle = IdlePage(self, self.state)
         self.drive = DrivePage(self, self.state)
 
-        # элементы DRIVE top bar, которые обрабатываются на уровне Main
-        self.btnStartStop: QtWidgets.QPushButton = self.findChild(QtWidgets.QPushButton, "btnStartStop")
-        self.btnMapPicker: QtWidgets.QPushButton = self.findChild(QtWidgets.QPushButton, "btnMapPicker")
-        self.btnEStop: QtWidgets.QPushButton = self.findChild(QtWidgets.QPushButton, "btnEStop")
+        # ✅ автозагрузка последней карты
+        s = QtCore.QSettings("Rover", "PlatformGUI")
+        last = s.value("maps/last_path", "")
+        if last and os.path.isfile(last):
+            try:
+                self._load_map_file(last)   # helper, который ты уже добавлял/добавишь ниже
+            except Exception as e:
+                print("[MAIN] autoload last map failed:", e, flush=True)
 
-        # E-STOP (заглушка)
-        if self.btnEStop:
-            self.btnEStop.clicked.connect(self._on_close_clicked)
+        # стартуем в IDLE
+        self.to_idle()
 
         # стартуем в IDLE
         self.to_idle()
@@ -89,14 +124,17 @@ class Main(QtWidgets.QMainWindow):
             os._exit(0)  # жёсткий выход на крайний случай
 
     def to_drive(self):
+        # подстраховка: если idle не установил режим — пусть будет markers
+        if not getattr(self.state, "nav_mode", None):
+            self.state.nav_mode = "markers"
+
         self.stack.setCurrentWidget(self.pageDrive)
-        # перерисуем оверлеи поверх карты DRIVE
+
         refresh_all_overlays(
             self.state,
             self.findChild(QtWidgets.QGraphicsView, "mapViewIdle"),
             self.findChild(QtWidgets.QGraphicsView, "mapViewDrive"),
         )
-
 
     def _on_drive_pick_map(self):
         if self.state.is_running:
@@ -171,86 +209,54 @@ class Main(QtWidgets.QMainWindow):
                 setattr(s, name, None)
         
     def pick_map_and_load(self):
-        # Полный сброс перед выбором карты
-        self._reset_everything_on_new_map()
-
-        # НЕНАТИВНЫЙ диалог (устойчивее в среде ROS/Wayland)
         start_dir = os.path.expanduser("/home/andrei/lidar_guard_ws/src/lidar_guard/ui/maps_repo")
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog  # NEW: избегаем крашей
-        try:
-            fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Выбрать карту (PNG)", start_dir,
-                "PNG (*.png);;Все файлы (*)", options=options
-            )
-        except Exception as e:
-            print("[MAP] QFileDialog error:", e, flush=True)
+        options |= QtWidgets.QFileDialog.DontUseNativeDialog
+
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Выбрать карту (PNG)", start_dir,
+            "PNG (*.png);;Все файлы (*)", options=options
+        )
+        if not fname:
             return
 
-        if not fname:
-            print("[MAP] отмена выбора", flush=True)
+        self._load_map_file(fname)
+        
+    def _load_map_file(self, fname: str):
+        if not fname or not os.path.isfile(fname):
             return
+
+        self._reset_everything_on_new_map()
 
         self.state.active_map_path = fname
-        # main_runtime.py (в конце pick_map_and_load, после self.state.active_map_path = fname)
         base = os.path.basename(fname)
         name, _ = os.path.splitext(base)
         self.state.map_name = name
 
-        # создать /datasets/photos/<map>/ и /datasets/lidar/<map>/
-        try:
-            photos_dir = os.path.join(self.state.dataset_root, "photos", name)
-            lidar_dir  = os.path.join(self.state.dataset_root, "lidar",  name)
-            os.makedirs(photos_dir, exist_ok=True)
-            os.makedirs(lidar_dir,  exist_ok=True)
-            print(f"[DATASET] dirs ready:\n  {photos_dir}\n  {lidar_dir}", flush=True)
-        except Exception as e:
-            print("[DATASET] mkdir error:", e, flush=True)
+        s = QtCore.QSettings("Rover", "PlatformGUI")
+        s.setValue("maps/last_path", fname)
+        s.setValue("maps/last_name", name)
 
-        # очистить ЗЕЛЁНЫЙ трек (новая карта = новый слой)
-        try:
-            self.state.visited_path_px = []
-            if getattr(self.state, "drive_visited_item", None):
-                sc = getattr(self.state, "_drive_scene", None)
-                if sc and self.state.drive_visited_item.scene() is sc:
-                    sc.removeItem(self.state.drive_visited_item)
-            self.state.drive_visited_item = None
-        except Exception:
-            pass
+        photos_dir = os.path.join(self.state.dataset_root, "photos", name)
+        lidar_dir  = os.path.join(self.state.dataset_root, "lidar",  name)
+        os.makedirs(photos_dir, exist_ok=True)
+        os.makedirs(lidar_dir, exist_ok=True)
 
-        # показать карту в обеих сценах
+        self.state.visited_path_px = []
+
         idle_view  = self.findChild(QtWidgets.QGraphicsView, "mapViewIdle")
         drive_view = self.findChild(QtWidgets.QGraphicsView, "mapViewDrive")
-        try:
-            show_map_on_views(fname, idle_view, drive_view, self.state)
-        except Exception as e:
-            print("[MAP] show_map_on_views error:", e, flush=True)
 
-        # загрузить граф/points
+        show_map_on_views(fname, idle_view, drive_view, self.state)
+
         from routing import load_graph_and_points_for, refresh_all_overlays
-        ok = False
-        try:
-            ok = load_graph_and_points_for(fname, self.state)
-        except Exception as e:
-            print("[MAP] load_graph_and_points_for error:", e, flush=True)
-        from routing import refresh_all_overlays
-        # перерисовать оверлеи
-        try:
-            refresh_all_overlays(self.state, idle_view, drive_view)
-        except Exception as e:
-            print("[MAP] refresh_all_overlays error:", e, flush=True)
+        load_graph_and_points_for(fname, self.state)
+        refresh_all_overlays(self.state, idle_view, drive_view)
 
-        # кнопка «Пуск» → гарантированно в «Пуск»
-        try:
-            self.state.is_running = False
-            btn = self.findChild(QtWidgets.QPushButton, "btnStartStop")
-            if btn:
-                btn.setChecked(False)
-                btn.setText("Пуск")
-        except Exception:
-            pass
-    
-
+        if hasattr(self, "drive"):
+            self.drive._load_persisted_settings()
+            self.drive._sync_tuning_from_state()
+            self.drive._apply_mode_tuning_ui()
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
@@ -260,6 +266,7 @@ def main():
     app.setApplicationName("Platform GUI")
 
     w = Main()
+    app.aboutToQuit.connect(w.drive.shutdown)
     w.setWindowFlags(QtCore.Qt.FramelessWindowHint)
     w.setGeometry(0, 0, 1920, 1200)     # заполняем экран полностью
     w.show()

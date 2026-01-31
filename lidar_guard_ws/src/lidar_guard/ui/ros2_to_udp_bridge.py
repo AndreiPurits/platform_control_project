@@ -40,27 +40,44 @@ class ScanToUdp(Node):
         self.get_logger().info(
             f"ScanToUdp: topic={topic} -> UDP {host}:{port}, step={self._step}"
         )
+        self._n = 0
+        self._t0 = self.get_clock().now()
 
-    # --- callback LaserScan ---
     def _on_scan(self, msg: LaserScan):
-        ranges = msg.ranges[::self._step]
-        payload = {
-            "angle_min": float(msg.angle_min),
-            "angle_increment": float(msg.angle_increment) * self._step,
-            "range_min": float(msg.range_min),
-            "range_max": float(msg.range_max),
-            "ranges": [
-                float(r) if math.isfinite(r) else None
-                for r in ranges
-            ],
-        }
-
-        data = json.dumps(payload).encode("utf-8")
         try:
-            self._sock.sendto(data, self._dst)
-        except Exception as e:
-            self.get_logger().warn(f"UDP send error: {e}")
+            src = msg.ranges
+            if src is None:
+                return
 
+            step = self._step
+            payload_ranges = []
+            # ВАЖНО: не слайсом, а по индексу — безопаснее для необычных типов
+            for i in range(0, len(src), step):
+                r = src[i]
+                try:
+                    rr = float(r)
+                    if math.isfinite(rr):
+                        payload_ranges.append(rr)
+                    else:
+                        payload_ranges.append(None)
+                except Exception:
+                    payload_ranges.append(None)
+
+            payload = {
+                "angle_min": float(msg.angle_min),
+                "angle_increment": float(msg.angle_increment) * step,
+                "range_min": float(msg.range_min),
+                "range_max": float(msg.range_max),
+                "ranges": payload_ranges,
+            }
+
+            data = json.dumps(payload).encode("utf-8")
+            self._sock.sendto(data, self._dst)
+
+        except Exception as e:
+            # не даём ноде умереть
+            self.get_logger().warn(f"ScanToUdp _on_scan error: {e}")
+            return
 
 def main():
     parser = argparse.ArgumentParser(

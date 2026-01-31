@@ -20,7 +20,7 @@
       <string>Ручное управление движением</string>
      </property>
      <property name="alignment">
-      <set>Qt::AlignHCenter|Qt::AlignVCenter</set>
+      <set>Qt::AlignCenter</set>
      </property>
     </widget>
    </item>
@@ -44,20 +44,23 @@
       <widget class="QToolButton" name="btnPwmMinus">
        <property name="minimumSize">
         <size>
-         <width>26</width>
-         <height>26</height>
+         <width>75</width>
+         <height>75</height>
         </size>
-       </property>
-       <property name="text">
-        <string>-</string>
        </property>
        <property name="toolTip">
         <string>Уменьшить PWM</string>
+       </property>
+       <property name="text">
+        <string>-</string>
        </property>
       </widget>
      </item>
      <item>
       <widget class="QSpinBox" name="spinManualPwm">
+       <property name="toolTip">
+        <string>Базовое значение PWM для движения</string>
+       </property>
        <property name="minimum">
         <number>1500</number>
        </property>
@@ -70,24 +73,21 @@
        <property name="value">
         <number>1800</number>
        </property>
-       <property name="toolTip">
-        <string>Базовое значение PWM для движения</string>
-       </property>
       </widget>
      </item>
      <item>
       <widget class="QToolButton" name="btnPwmPlus">
        <property name="minimumSize">
         <size>
-         <width>26</width>
-         <height>26</height>
+         <width>75</width>
+         <height>75</height>
         </size>
-       </property>
-       <property name="text">
-        <string>+</string>
        </property>
        <property name="toolTip">
         <string>Увеличить PWM</string>
+       </property>
+       <property name="text">
+        <string>+</string>
        </property>
       </widget>
      </item>

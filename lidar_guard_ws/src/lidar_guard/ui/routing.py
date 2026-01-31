@@ -41,6 +41,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import os
 import json
 import math
+import bisect
 import heapq
 import numpy as np
 Point = Tuple[float, float]
@@ -914,7 +915,12 @@ def build_route_via_goals(state) -> bool:
 
     for i in range(len(waypoints) - 1):
         seg_start = waypoints[i]
-        seg_goal  = waypoints[i+1]
+        seg_goal  = waypoints[i + 1]
+
+        # ВАЖНО: сбросить маршрут, иначе build_route_from_robot_to_goal "дописывает" к старому
+        state.route_pts_px = []
+        state.route_pts_m  = []
+        state.route_len_m  = 0.0
 
         state.robot_px = seg_start
         state.goal_px  = seg_goal
@@ -922,7 +928,6 @@ def build_route_via_goals(state) -> bool:
         ok = build_route_from_robot_to_goal(state)
         if not ok:
             print(f"[ROUTING] via_goals: segment {i} failed: {seg_start} -> {seg_goal}", flush=True)
-            # откат
             state.robot_px = orig_robot
             state.goal_px  = orig_goal
             return False
@@ -1043,215 +1048,173 @@ def route_caption_text(state) -> str:
 
     return line1 + "\n" + line2 + "\n" + line3
 
-
 def update_progress_text_for_robot(*args, **kwargs) -> str:
     state = args[-1] if args else kwargs.get("state")
     return route_caption_text(state)
+import numpy as np
 
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
+def detect_turn_branches_from_roadbin(st, road_bin_crop: np.ndarray):
+    """
+    Возвращает (has_left, has_right, has_center) по CROPPED road_bin.
+    Логика:
+      - y_top = самая верхняя "горизонтальная" линия дороги (берём из st._main_line['y_scan_crop'])
+      - анализируем band по высоте: y_top .. y_top + frac*(H-y_top), где frac ~ 0.66 (2/3)
+      - left/right зоны: 20% ширины по краям
+      - если доля маски в зоне >= thr => поворот
+    """
+    if road_bin_crop is None or getattr(road_bin_crop, "size", 0) == 0:
+        return (False, False, False)
 
+    rb = (road_bin_crop.astype(np.uint8) > 0).astype(np.uint8)
+    H, W = rb.shape[:2]
+
+    # --- параметры зоны поворотов (ТОЛЬКО цифры) ---
+    y0_frac = float(getattr(st, "cam_turn_y0_frac", 0.4) or 0.4)
+    y1_frac = float(getattr(st, "cam_turn_y1_frac", 0.65) or 0.65)
+
+    y0_frac = float(_clamp(y0_frac, 0.05, 0.90))
+    y1_frac = float(_clamp(y1_frac, y0_frac + 0.05, 0.98))
+
+    y0 = int(y0_frac * H)
+    y1 = int(y1_frac * H)
+
+    y0 = int(_clamp(y0, 0, H - 2))
+    y1 = int(_clamp(y1, y0 + 1, H))
+
+    band = rb[y0:y1, :]
+    if band.size == 0:
+        return (False, False, False)
+    # ширина боковых зон: 15% (настраиваемо)
+    side_frac = float(getattr(st, "cam_turn_side_w_frac", 0.15) or 0.15)
+    side_frac = float(_clamp(side_frac, 0.08, 0.35))
+    wS = int(_clamp(int(W * side_frac), 1, W // 2 - 2))
+
+    left_zone  = band[:, :wS]
+    right_zone = band[:, W - wS:]
+    center_zone = band[:, wS:W - wS]  # всё между ними
+
+    lf = float(left_zone.mean()) if left_zone.size else 0.0
+    rf = float(right_zone.mean()) if right_zone.size else 0.0
+    cf = float(center_zone.mean()) if center_zone.size else 0.0
+
+    # сохраним для HUD/отладки
+    st.fturn_l = lf
+    st.fturn_c = cf
+    st.fturn_r = rf
+
+    # пороги
+    side_thr = float(getattr(st, "cam_turn_side_thr", 0.1) or 0.1)   # доля маски в боковой зоне
+    side_thr = float(_clamp(side_thr, 0.01, 0.80))
+
+    center_min = float(getattr(st, "cam_turn_center_min", 0.06) or 0.06)  # очень мягко
+    center_min = float(_clamp(center_min, 0.00, 0.80))
+
+    require_center = bool(getattr(st, "cam_turn_require_center", True))
+
+    has_center = (cf >= center_min) if require_center else True
+    has_left  = bool(has_center and (lf >= side_thr))
+    has_right = bool(has_center and (rf >= side_thr))
+
+    return (has_left, has_right, bool(has_center))
 def maybe_snap_robot_to_junction_by_camera(
     state,
     mask: np.ndarray,
-    # --- окна поиска перекрёстка ПО МАРШРУТУ (по метрам вдоль polyline) ---
-    search_ahead_m: float = 12.0,     # ищем junction в пределах done..done+ahead
-    search_behind_m: float = 12.0,    # и done-behind..done (чтобы уметь "снэпнуть назад")
-    # --- когда разрешаем снап относительно найденного перекрёстка ---
-    min_abs_delta_m: float = 2.0,     # если |s_junc - done| меньше — не снапаем (слишком поздно/шум)
-    max_abs_delta_m: float = 25.0,    # если |s_junc - done| больше — не снапаем (слишком рано/далеко)
-    # --- куда именно ставим done после детекта перекрёстка ---
-    snap_before_m: float = 12.0,      # ставим в точку на polyline: (s_junc - snap_before_m)
-    min_move_m: float = 0.3,          # чтобы не делать микро-снэпы
-    # --- фильтр "камерой увидели перекрёсток" ---
-    thr: float = 0.6,
-    side_thr: float = 0.12,
-    center_min: float = 0.10,
+    search_ahead_m: float = 22.0,
+    search_behind_m: float = 18.0,
+    min_abs_delta_m: float = 0.6,
+    max_abs_delta_m: float = 18.0,
+    snap_before_m: float = 8.0,
+    min_move_m: float = 0.3,
+    thr: float = 0.6,            # если road_bin_crop не передали — порог для mask->bin
     cooldown_s: float = 30.0,
+    diag_window_m: float = 12.0,
 
-    # --- диагностика “не снапнулось” ---
-    diag_window_m: float = 12.0,      # если jdist <= diag_window_m и прошли/почти прошли junction — можно логнуть
+    # NEW: лучше передавать сюда road_bin после постпроцесса (CROPPED)
+    road_bin_crop=None,
 ) -> None:
     """
-    Камера говорит "похоже перекрёсток" -> корректируем robot_px/route_done_m вдоль маршрута.
+    SNAP: по графу/маршруту как и было (через state._junc_proj),
+    но "камера увидела перекрёсток" теперь определяется ТОЛЬКО по road_bin_crop
+    (20% края по ширине, по высоте от y_top до ~2/3 вниз).
 
-    ВАЖНО:
-    - junction берём из state._junc_proj (строится update_junction_turn_hint), т.е. та же база из 10 перекрёстков.
-    - ищем ближайший подходящий junction и впереди, и сзади (в пределах окон search_*_m).
-    - снап ставит done = s_junc - snap_before_m (до перекрёстка), не в центр.
+    ВАЖНО: state-поля остаются те же:
+      state.cam_junc_seen, state.cam_junc_seen_ts
+      state._cam_junc_seen_lr, state._cam_junc_last_seen_ts
+      state.fturn_l/c/r
+      state._last_cam_snap_j_id/_ts
     """
-
-    import time, bisect
-
-    poly_px = getattr(state, "route_pts_px", None) or []
-    poly_m  = getattr(state, "route_pts_m",  None) or []
-    robot   = getattr(state, "robot_px", None)
-
-    if robot is None or mask is None or len(poly_px) < 2 or len(poly_m) < 2:
-        return
+    import time, bisect, math
 
     now = time.monotonic()
     done = float(getattr(state, "route_done_m", 0.0) or 0.0)
 
-    # ------------------------------------------------------------
-    # A) ВСПОМОГАТЕЛЬНО: диагностируем "проехали junction по графу, но snap не случился"
-    # ------------------------------------------------------------
-    # Условия: есть активный junction из хинта (или ближайший по jdist),
-    # done уже "прошёл" s_junc + pass_clear_m (или почти прошёл), но _last_cam_snap_j_id != j_id.
-    # Лог делаем 1 раз на junction, чтобы не спамить.
-    def _diag_missed(reason: str, details: str = ""):
-        j_id = getattr(state, "_active_turn_j_id", None)
-        s_j = getattr(state, "_active_turn_s_m", None)
-        if j_id is None or s_j is None:
+    poly_px = getattr(state, "route_pts_px", None) or []
+    poly_m  = getattr(state, "route_pts_m",  None) or []
+    if len(poly_px) < 2 or len(poly_m) < 2:
+        return
+
+    # --- road_bin source ---
+    if road_bin_crop is None:
+        if mask is None or getattr(mask, "size", 0) == 0:
             return
-        # один раз на junction
-        key = (int(j_id),)
-        seen = getattr(state, "_diag_missed_junc", None)
-        if not isinstance(seen, set):
-            seen = set()
-            state._diag_missed_junc = seen
-        if key in seen:
-            return
-        seen.add(key)
+        # fallback: делаем bin из mask (но лучше передавать postprocessed road_bin)
+        road_bin_crop = (mask > float(thr))
 
-        turn = getattr(state, "next_turn_dir", None)
-        adeg = float(getattr(state, "turn_deg", 0.0) or 0.0)
-        lr = getattr(state, "_cam_junc_seen_lr", None)
-        lr_txt = f" cam_lr={lr}" if lr is not None else ""
+    # --- новый детект L/R/C по road_bin ---
+    try:
+        lr_raw = detect_turn_branches_from_roadbin(state, road_bin_crop)
+        lr = update_cam_lr_debounced(state, lr_raw)
+    except Exception:
+        # не ломаем пайплайн
+        return
 
-        print(
-            f"[CAM SNAP][MISS] j_id={int(j_id)} turn={turn} deg={adeg:.1f} "
-            f"done={done:.1f} s_j={float(s_j):.1f} reason={reason}{lr_txt}"
-            + (f" | {details}" if details else ""),
-            flush=True
-        )
+    has_left, has_right, has_center = lr
 
-    # Если хинт активен и мы уже реально "перешагнули" junction, но снапа не было — логнем.
-    active_j = getattr(state, "_active_turn_j_id", None)
-    active_s = getattr(state, "_active_turn_s_m", None)
-    if active_j is not None and active_s is not None:
-        # Если мы уже прошли по маршруту junction + 1м, а снапа на этот j_id не было
-        if done >= float(active_s) + 1.0:
-            last_snap_j = getattr(state, "_last_cam_snap_j_id", None)
-            if last_snap_j is None or int(last_snap_j) != int(active_j):
-                # Причины ниже уточним в зависимости от состояния камеры/кулдауна.
-                cam_ts = float(getattr(state, "cam_junc_seen_ts", 0.0) or 0.0)
-                cam_ok = (cam_ts > 0.0) and ((now - cam_ts) <= 0.6)
-                if not cam_ok:
-                    _diag_missed("camera_not_seen_recent", "cam_junc_seen_ts too old or never set")
-                else:
-                    # камера видела, значит вероятнее всего отфильтровали окна/дельты/cooldown
-                    last_ts = float(getattr(state, "_last_cam_snap_ts", 0.0) or 0.0)
-                    if (now - last_ts) < float(cooldown_s):
-                        _diag_missed("cooldown", f"cooldown_s={cooldown_s:.1f} remaining={cooldown_s-(now-last_ts):.1f}s")
-                    else:
-                        # могли не найти proj или отсеять по abs_delta
-                        proj = getattr(state, "_junc_proj", None) or []
-                        if not proj:
-                            _diag_missed("no_junc_proj_cache", "update_junction_turn_hint hasn't built _junc_proj yet")
-                        else:
-                            _diag_missed("filtered_by_windows_or_abs_delta",
-                                         f"search_ahead_m={search_ahead_m} search_behind_m={search_behind_m} "
-                                         f"min_abs_delta_m={min_abs_delta_m} max_abs_delta_m={max_abs_delta_m}")
+    # сохраняем в state (как раньше)
+    state._cam_junc_seen_lr = (bool(has_left), bool(has_right), bool(has_center))
 
-    # ------------------------------------------------------------
-    # B) cooldown (не чаще 1 раза в cooldown_s)
-    # ------------------------------------------------------------
-    # твой флажок cam_junc_seen "живёт" 0.6s
+    # флаг "видим перекрёсток": центр + (лево или право)
+    seen = bool(has_center and (has_left or has_right))
+
+    # TTL 0.6с как у тебя было
     if (now - float(getattr(state, "cam_junc_seen_ts", 0.0) or 0.0)) > 0.6:
         state.cam_junc_seen = False
 
+    if not seen:
+        # если по графу близко, можно (опционально) диагностировать — оставляю твою идею, но без спама
+        jdist = getattr(state, "jdist", None)
+        if jdist is not None and float(jdist) <= float(diag_window_m):
+            # один раз на активный junction
+            active_j = getattr(state, "_active_turn_j_id", None)
+            if active_j is not None:
+                key = ("cam_reject", int(active_j))
+                seen_set = getattr(state, "_diag_cam_reject", None)
+                if not isinstance(seen_set, set):
+                    seen_set = set()
+                    state._diag_cam_reject = seen_set
+                if key not in seen_set:
+                    seen_set.add(key)
+                    print(f"[CAM] reject LR={state._cam_junc_seen_lr} f=({getattr(state,'fturn_l',0):.2f},{getattr(state,'fturn_c',0):.2f},{getattr(state,'fturn_r',0):.2f})", flush=True)
+        return
+
+    # отметим "видим"
+    state.cam_junc_seen = True
+    state.cam_junc_seen_ts = now
+    state._cam_junc_last_seen_ts = now
+
+    # cooldown
     last_ts = float(getattr(state, "_last_cam_snap_ts", 0.0) or 0.0)
     if (now - last_ts) < float(cooldown_s):
         return
 
-    # ------------------------------------------------------------
-    # C) детект "похоже перекрёсток" по маске: 30% / 40% / 30%
-    # ------------------------------------------------------------
-    H, W = mask.shape[:2]
-    road_bin = (mask > float(thr))
-
-    band_h = max(3, int(H * 0.60))
-    band = road_bin[:band_h, :]
-
-    wL = int(W * 0.30)
-    wC = int(W * 0.40)
-    wR = W - (wL + wC)
-    if wR < 1:
-        wR = 1
-        wC = max(1, W - wL - wR)
-
-    left_band   = band[:, :wL]
-    center_band = band[:, wL:wL + wC]
-    right_band  = band[:, wL + wC:]
-
-    lf = float(left_band.mean()) if left_band.size else 0.0
-    cf = float(center_band.mean()) if center_band.size else 0.0
-    rf = float(right_band.mean()) if right_band.size else 0.0
-
-    has_left   = (lf > float(side_thr))
-    has_right  = (rf > float(side_thr))
-    has_center = (cf > float(center_min))
-
-    if not (has_center and (has_left or has_right)):
-        # если по графу уже близко к junction — можно лаконично сообщить почему камера не подтверждает
-        jdist = getattr(state, "jdist", None)
-        if jdist is not None and float(jdist) <= float(diag_window_m):
-            # один раз на активный junction (чтобы не спамить)
-            active_j = getattr(state, "_active_turn_j_id", None)
-            if active_j is not None:
-                key = ("cam_reject", int(active_j))
-                seen = getattr(state, "_diag_cam_reject", None)
-                if not isinstance(seen, set):
-                    seen = set()
-                    state._diag_cam_reject = seen
-                if key not in seen:
-                    seen.add(key)
-                    turn = getattr(state, "next_turn_dir", None)
-                    adeg = float(getattr(state, "turn_deg", 0.0) or 0.0)
-                    # причина “не хватает дороги на стороне поворота”
-                    need_side = None
-                    if turn == "left":
-                        need_side = "left"
-                    elif turn == "right":
-                        need_side = "right"
-
-                    # сформируем текст причины
-                    details = f"lf={lf:.2f} cf={cf:.2f} rf={rf:.2f} thr={thr:.2f} side_thr={side_thr:.2f} center_min={center_min:.2f}"
-                    if need_side == "left" and not has_left:
-                        _diag_missed("cam_reject_not_enough_left_road", details)
-                    elif need_side == "right" and not has_right:
-                        _diag_missed("cam_reject_not_enough_right_road", details)
-                    elif not has_center:
-                        _diag_missed("cam_reject_no_center_road", details)
-                    else:
-                        _diag_missed("cam_reject", details)
-        return
-
-    # камера ВИДИТ перекрёсток
-    state.cam_junc_seen = True
-    state.cam_junc_seen_ts = now
-
-    # важно для road-follow gating
-    state._cam_junc_last_seen_ts = now
-    state._cam_junc_seen_lr = (bool(has_left), bool(has_right), bool(has_center))
-
-    # debug (как у тебя)
-    state.fturn_l = lf
-    state.fturn_c = cf
-    state.fturn_r = rf
-
-    # ------------------------------------------------------------
-    # D) берём junction-projection из turn-hint (та же база 10 перекрёстков)
-    # ------------------------------------------------------------
+    # --- junction candidates from graph (как было) ---
     proj = getattr(state, "_junc_proj", None) or []
-    # ожидаемый формат: (s_m, seg_i, t, j_id, dist_px)
     if not proj:
-        # если кэш ещё не построен — снап НЕ делаем
         return
 
-    # ------------------------------------------------------------
-    # E) выбираем целевой перекрёсток в окне по маршруту (и впереди, и сзади)
-    # ------------------------------------------------------------
     lo = done - float(search_behind_m)
     hi = done + float(search_ahead_m)
 
@@ -1266,7 +1229,6 @@ def maybe_snap_robot_to_junction_by_camera(
 
         if abs_delta < float(min_abs_delta_m) or abs_delta > float(max_abs_delta_m):
             continue
-
         if best is None or abs_delta < best[0]:
             best = (abs_delta, delta, s_junc, int(seg_i), float(t), int(j_id), float(dist_px))
 
@@ -1275,16 +1237,12 @@ def maybe_snap_robot_to_junction_by_camera(
 
     _, delta, s_junc, seg_i, t, j_id, dist_px = best
 
-    # ------------------------------------------------------------
-    # F) не повторяем снап на тот же перекрёсток
-    # ------------------------------------------------------------
+    # не повторяем snap на тот же перекрёсток
     last_j = getattr(state, "_last_cam_snap_j_id", None)
     if last_j is not None and int(last_j) == int(j_id):
         return
 
-    # ------------------------------------------------------------
-    # G) target_done = s_junc - snap_before_m (ДО перекрёстка)
-    # ------------------------------------------------------------
+    # --- cum_m (как было) ---
     cum_m = [0.0]
     total = 0.0
     for a, b in zip(poly_m, poly_m[1:]):
@@ -1297,9 +1255,7 @@ def maybe_snap_robot_to_junction_by_camera(
     if abs(target_done - done) < float(min_move_m):
         return
 
-    # ------------------------------------------------------------
-    # H) интерполируем robot_px по target_done
-    # ------------------------------------------------------------
+    # интерполяция robot_px по target_done (как было)
     k = bisect.bisect_right(cum_m, target_done) - 1
     k = max(0, min(len(cum_m) - 2, k))
 
@@ -1311,9 +1267,7 @@ def maybe_snap_robot_to_junction_by_camera(
     x = float(ax + tt * (bx - ax))
     y = float(ay + tt * (by - ay))
 
-    # ------------------------------------------------------------
-    # I) применяем snap
-    # ------------------------------------------------------------
+    # применяем snap (как было)
     state.robot_px = (x, y)
     state.route_done_m = float(target_done)
     state.route_progress_idx = int(k)
@@ -1322,12 +1276,33 @@ def maybe_snap_robot_to_junction_by_camera(
     state._last_cam_snap_ts = now
 
     print(
-        f"[CAM SNAP] j_id={j_id}  delta={delta:+.1f}m  target_done={target_done:.1f}m  "
-        f"s_junc={s_junc:.1f}m  dist_px={dist_px:.1f}  "
-        f"lf={lf:.2f} cf={cf:.2f} rf={rf:.2f}",
+        f"[CAM SNAP] j_id={j_id} delta={delta:+.1f}m target_done={target_done:.1f}m "
+        f"s_junc={s_junc:.1f}m dist_px={dist_px:.1f} LR=({int(has_left)},{int(has_right)},{int(has_center)})",
         flush=True
     )
+def update_cam_lr_debounced(st, lr_raw):
+    # lr_raw = (L,R,C)
+    need_n = int(getattr(st, "cam_lr_need_n", 6) or 6)        # сколько кадров подряд
+    forget_n = int(getattr(st, "cam_lr_forget_n", 10) or 10)  # сколько кадров без сигнала чтобы сбросить
 
+    if not hasattr(st, "_cam_lr_cnt"):
+        st._cam_lr_cnt = {"L": 0, "R": 0, "C": 0}
+    if not hasattr(st, "_cam_lr_off"):
+        st._cam_lr_off = {"L": 0, "R": 0, "C": 0}
+
+    out = []
+    for key, v in zip(("L", "R", "C"), lr_raw):
+        if v:
+            st._cam_lr_cnt[key] = min(need_n, st._cam_lr_cnt[key] + 1)
+            st._cam_lr_off[key] = 0
+        else:
+            st._cam_lr_off[key] = min(forget_n, st._cam_lr_off[key] + 1)
+            if st._cam_lr_off[key] >= forget_n:
+                st._cam_lr_cnt[key] = 0
+
+        out.append(st._cam_lr_cnt[key] >= need_n)
+
+    return (bool(out[0]), bool(out[1]), bool(out[2]))
 
 def update_junction_turn_hint(
     state,
@@ -1552,3 +1527,88 @@ def update_junction_turn_hint(
                 f"[TURN HINT] {turn}  j_id={j_id}  jdist={state.jdist:.1f}m  d={d_deg:.1f}deg  dist_px={dist_px:.1f}",
                 flush=True
             )
+            # гарантированная очистка после проезда (не зависит от road-follow)
+            pass_clear_m = float(getattr(state, "pass_clear_m", 1.0) or 1.0)
+            maybe_clear_turn_state(state, pass_clear_m=pass_clear_m)    
+    def maybe_clear_turn_state(state, pass_clear_m: float = 1.0) -> None:
+        """
+        Гарантированная очистка состояния поворота после прохождения junction.
+        Должна вызываться из update_junction_turn_hint() каждый тик.
+        """
+        active_s = getattr(state, "_active_turn_s_m", None)
+        if active_s is None:
+            return
+
+        done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
+        if done_m < float(active_s) + float(pass_clear_m):
+            return
+
+        j_id = getattr(state, "_active_turn_j_id", None)
+        if getattr(state, "_turn_phase", None) is not None:
+            print(f"[TURN][PASSED]   j_id={j_id} done={done_m:.1f}m", flush=True)
+
+        # --- turn hint ---
+        state.fturn = None
+        state._fturn_ts = None
+
+        # --- camera turn debug ---
+        state.fturn_l = 0.0
+        state.fturn_c = 0.0
+        state.fturn_r = 0.0
+
+        # --- active junction ---
+        state._active_turn_j_id = None
+        state._active_turn_s_m = None
+        state._turn_phase = None
+
+        # --- camera gating ---
+        state.cam_junc_seen = False
+        state.cam_junc_seen_ts = 0.0
+        state._cam_junc_last_seen_ts = 0.0
+        state._cam_junc_seen_lr = None
+
+        # --- turn permission flags (для UI/road_follow) ---
+        state.turn_bias_allowed = False
+        state.turn_allowed = False
+        state.turn_execute = False
+    def maybe_clear_turn_state(state, pass_clear_m: float = 1.0) -> None:
+        """
+        Гарантированная очистка состояния поворота после прохождения junction.
+        Должна вызываться из update_junction_turn_hint() каждый тик.
+        """
+        active_s = getattr(state, "_active_turn_s_m", None)
+        if active_s is None:
+            return
+
+        done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
+        if done_m < float(active_s) + float(pass_clear_m):
+            return
+
+        j_id = getattr(state, "_active_turn_j_id", None)
+        if getattr(state, "_turn_phase", None) is not None:
+            print(f"[TURN][PASSED]   j_id={j_id} done={done_m:.1f}m", flush=True)
+
+        # --- turn hint ---
+        state.fturn = None
+        state._fturn_ts = None
+
+        # --- camera turn debug ---
+        state.fturn_l = 0.0
+        state.fturn_c = 0.0
+        state.fturn_r = 0.0
+
+        # --- active junction ---
+        state._active_turn_j_id = None
+        state._active_turn_s_m = None
+        state._turn_phase = None
+
+        # --- camera gating ---
+        state.cam_junc_seen = False
+        state.cam_junc_seen_ts = 0.0
+        state._cam_junc_last_seen_ts = 0.0
+        state._cam_junc_seen_lr = None
+
+        # --- turn permission flags (для UI/road_follow) ---
+        state.turn_bias_allowed = False
+        state.turn_allowed = False
+        state.turn_execute = False
