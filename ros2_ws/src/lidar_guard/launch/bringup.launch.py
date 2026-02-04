@@ -6,7 +6,9 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     # Параметры лидара
-    lidar_port_arg = DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0')
+    default_port = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8200a3a9df73ef11b5d7c68c8fcc3fa0-if00-port0"
+
+    lidar_port_arg = DeclareLaunchArgument('lidar_port', default_value=default_port)
     lidar_baud_arg = DeclareLaunchArgument('lidar_baud', default_value='460800')
     lidar_port = LaunchConfiguration('lidar_port')
     lidar_baud = LaunchConfiguration('lidar_baud')
