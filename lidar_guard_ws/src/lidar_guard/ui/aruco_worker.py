@@ -8,77 +8,46 @@ import numpy as np
 import cv2
 from multiprocessing.connection import Connection
 
-
 def _make_aruco_detector():
     """
     Returns (aruco, aruco_dict, detector_or_None, params_or_None)
-    Compatible with OpenCV 4.6+ and newer ArucoDetector API.
+    Tuned for STABILITY (no blinking at 1–3 m).
     """
     if not hasattr(cv2, "aruco"):
-        raise RuntimeError("cv2.aruco is not available in this OpenCV build")
+        raise RuntimeError("cv2.aruco is not available")
 
     aruco = cv2.aruco
     aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 
-    # Parameters object
     if hasattr(aruco, "DetectorParameters_create"):
         params = aruco.DetectorParameters_create()
-    elif hasattr(aruco, "DetectorParameters"):
-        params = aruco.DetectorParameters()
     else:
-        params = None
+        params = aruco.DetectorParameters()
 
-    # --- tune params for far/small markers ---
-    if params is not None:
-        # Subpixel corner refinement -> helps a lot at distance
-        try:
-            params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-        except Exception:
-            pass
+    # ---------- CRITICAL TUNING ----------
+    params.adaptiveThreshWinSizeMin = 7
+    params.adaptiveThreshWinSizeMax = 45
+    params.adaptiveThreshWinSizeStep = 6
 
-        # Adaptive threshold windows (robust to uneven lighting)
-        for name, val in [
-            ("adaptiveThreshWinSizeMin", 3),
-            ("adaptiveThreshWinSizeMax", 63),
-            ("adaptiveThreshWinSizeStep", 10),
-        ]:
-            try:
-                setattr(params, name, val)
-            except Exception:
-                pass
+    params.minMarkerPerimeterRate = 0.015
+    params.maxMarkerPerimeterRate = 4.0
 
-        # Allow smaller markers (careful: too low => false positives)
-        try:
-            params.minMarkerPerimeterRate = 0.015  # a bit lower than typical
-        except Exception:
-            pass
+    params.polygonalApproxAccuracyRate = 0.05
+    params.minCornerDistanceRate = 0.005
 
-        # Corner distance & border margins
-        try:
-            params.minCornerDistanceRate = 0.01
-        except Exception:
-            pass
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5
+    params.cornerRefinementMaxIterations = 50
+    params.cornerRefinementMinAccuracy = 0.01
 
-        # Often helps with weak edges
-        try:
-            params.perspectiveRemovePixelPerCell = 8
-        except Exception:
-            pass
-        try:
-            params.perspectiveRemoveIgnoredMarginPerCell = 0.20
-        except Exception:
-            pass
-
-    # New API (4.7+): ArucoDetector
     detector = None
-    if hasattr(aruco, "ArucoDetector") and params is not None:
+    if hasattr(aruco, "ArucoDetector"):
         try:
             detector = aruco.ArucoDetector(aruco_dict, params)
         except Exception:
             detector = None
 
     return aruco, aruco_dict, detector, params
-
 
 def _to_gray(img: np.ndarray) -> np.ndarray | None:
     """
@@ -201,114 +170,147 @@ def _detect_one(
 
     tvec = None
     dist_m = None
+    pose_ok = False
 
-    # pose estimate in FULL coords (K/D must correspond to full frame)
-    if K is not None and D is not None:
-        try:
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                [c_full], float(marker_len_m), K, D
-            )
-            tv = tvecs[0][0]
-            tvec = (float(tv[0]), float(tv[1]), float(tv[2]))
-            dist_m = float(tv[2])
-        except Exception:
-            tvec = None
-            dist_m = None
-
-    # fallback monotonic "distance" if pose failed
-    if dist_m is None:
-        area_full_est = max(1e-9, float(area_small) * float(ds_eff * ds_eff))
-        dist_m = 1.0 / max(1e-6, np.sqrt(area_full_est))
+    # ❌ НИКАКИХ "фейковых метров"
+    if not pose_ok:
+        dist_m = None
 
     side = "R" if (tvec is not None and tvec[0] > 0.0) else ("L" if cx < (W * 0.5) else "R")
 
     return {
-        "id": int(mid),
-        "cx": float(cx),
-        "cy": float(cy),
-        "area_small": float(area_small),
-        "downscale": int(ds_eff),
-        "dist_m": float(dist_m),
-        "side": side,
-        "tvec": tvec,
-        "corners": c_full.tolist(),  # 4x2 in FULL coords
-        "img_wh": (int(W), int(H)),
-    }
-
-
+            "id": int(mid),
+            "cx": float(cx),
+            "cy": float(cy),
+            "dist_m": dist_m,
+            "pose_ok": bool(pose_ok),
+            "tvec": tvec,
+            "corners": c_full.tolist(),
+            "img_wh": (int(W), int(H)),
+        }
+                                   
 def run(conn: Connection):
-    """
-    Protocol:
-      None -> exit
-      (img_bytes, wanted_ids_list, marker_len_m, K, D, downscale_int)
-        -> send(result_dict_or_None)
-    """
-
-    # Stabilize OpenCV threading
-    try:
-        cv2.setNumThreads(1)
-    except Exception:
-        pass
-    try:
-        cv2.ocl.setUseOpenCL(False)
-    except Exception:
-        pass
 
     aruco, aruco_dict, detector, params = _make_aruco_detector()
 
+    # можно крутить из state через message, но тут фиксируем как "то состояние"
+    downscale = 1  # НЕ уменьшаем (раз у тебя и так crop)
+
     while True:
-        msg = conn.recv()
+        try:
+            msg = conn.recv()
+        except EOFError:
+            break
+        except Exception:
+            continue
+
         if msg is None:
             break
 
-        # back-compat: 5 fields -> downscale=2
+        # ожидаем: (jpg_bytes, wanted_ids, marker_len_m, K, D)
         try:
-            if len(msg) == 5:
-                img_bytes, wanted_ids, marker_len_m, K, D = msg
-                downscale = 2
+            jpg_bytes, wanted_ids, marker_len_m, K, D = msg
+        except Exception:
+            continue
+
+        # decode jpg -> gray
+        try:
+            arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                conn.send(None)
+                continue
+        except Exception:
+            conn.send(None)
+            continue
+
+        gray = np.ascontiguousarray(img)
+        H, W = gray.shape[:2]
+
+        # downscale (обычно 1)
+        small, ds_eff = _downscale_gray(gray, downscale)
+
+        # detect
+        try:
+            if detector is not None:
+                corners, ids, _ = detector.detectMarkers(small)
             else:
-                img_bytes, wanted_ids, marker_len_m, K, D, downscale = msg
+                corners, ids, _ = aruco.detectMarkers(small, aruco_dict, parameters=params)
         except Exception:
             conn.send(None)
             continue
 
-        # decode (PNG/JPEG) -> gray or bgr
-        try:
-            arr = np.frombuffer(img_bytes, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)  # can be HxW or HxWx3
-        except Exception:
-            img = None
-
-        if img is None or getattr(img, "size", 0) == 0:
+        if ids is None or len(ids) == 0:
             conn.send(None)
             continue
 
-        # K/D as contiguous float64
-        if K is not None:
-            K = np.ascontiguousarray(K, dtype=np.float64)
-        if D is not None:
-            D = np.ascontiguousarray(D, dtype=np.float64)
+        wanted_set = set(int(x) for x in (wanted_ids or []))
+        best = _pick_best_marker(corners, ids, wanted_set)
+        if best is None:
+            conn.send(None)
+            continue
 
-        wanted = set(int(x) for x in (wanted_ids or []))
+        mid, c_small, area_small = best
+
+        # corners -> full coords of CROPPED image
+        if ds_eff != 1:
+            c_full = c_small * float(ds_eff)
+        else:
+            c_full = c_small
+        c_full = np.ascontiguousarray(c_full, dtype=np.float32)
+
+        cx = float(c_full[:, 0].mean())
+        cy = float(c_full[:, 1].mean())
+
+        tvec = None
+        dist_m = None
+        pose_ok = False
+
+        # ---- POSE (как "то состояние"): считаем на CROPPED, но K/D от FULL (без пересчёта) ----
+        try:
+            if K is not None:
+                K = np.asarray(K, dtype=np.float64)
+            if D is not None:
+                D = np.asarray(D, dtype=np.float64)
+
+            if (K is not None) and (K.size == 9) and (marker_len_m is not None):
+                # estimatePoseSingleMarkers expects corners shape: (N, 1, 4, 2)
+                c_in = c_full.reshape(1, 1, 4, 2).astype(np.float32)
+
+                rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
+                    c_in,
+                    float(marker_len_m),
+                    K,
+                    D if D is not None else None,
+                )
+                if tvecs is not None and len(tvecs) > 0:
+                    tv = np.asarray(tvecs[0, 0], dtype=np.float64)
+                    tvec = (float(tv[0]), float(tv[1]), float(tv[2]))
+                    dist_m = float(np.linalg.norm(tv))
+                    pose_ok = True
+        except Exception:
+            # если поза не посчиталась — оставим None
+            tvec = None
+            dist_m = None
+            pose_ok = False
+
+        side = "R" if (tvec is not None and float(tvec[0]) > 0.0) else ("L" if cx < (W * 0.5) else "R")
+
+        out = {
+            "id": int(mid),
+            "cx": float(cx),
+            "cy": float(cy),
+            "dist_m": dist_m,
+            "pose_ok": bool(pose_ok),
+            "tvec": tvec,
+            "corners": c_full.tolist(),
+            "img_wh": (int(W), int(H)),  # это размеры CROPPED
+            "side": side,
+        }
 
         try:
-            res = _detect_one(
-                img=img,
-                wanted_ids=wanted,
-                marker_len_m=float(marker_len_m),
-                K=K,
-                D=D,
-                downscale=int(downscale) if downscale is not None else 1,
-                aruco=aruco,
-                aruco_dict=aruco_dict,
-                detector=detector,
-                params=params,
-            )
+            conn.send(out)
         except Exception:
-            res = None
-
-        conn.send(res)
-
-
+            pass
 if __name__ == "__main__":
     pass

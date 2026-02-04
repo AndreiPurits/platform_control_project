@@ -1504,9 +1504,6 @@ def update_junction_turn_hint(
     if int(j_idx) == 9 and turn == "straight":
         turn = "left"
         state.next_turn_dir = "left"
-    # ---------------------------
-    # 4) триггер 1 раз на junction за сессию движения (но можно повторно после backtrack/reset)
-    # ---------------------------
     if state.jdist <= float(announce_dist_m):
         announced = getattr(state, "_announced_junc_ids", None)
         if not isinstance(announced, set):
@@ -1520,95 +1517,73 @@ def update_junction_turn_hint(
             state.fturn = turn
             state._fturn_ts = now
             state._active_turn_j_id = j_id
-            state._active_turn_s_m  = s_j   # ВАЖНО: это абсолют по маршруту
-            #print(f"[TURN HINT] {s_j} = s_j",flush=True)
-            # лаконичный лог факта
+            state._active_turn_s_m  = s_j   # абсолют по маршруту
+
+            # --- freeze ONLY for markers AND only for real turns (> route_turn_angle_deg) ---
+            if str(getattr(state, "nav_mode", "") or "") == "markers":
+                thr_deg = float(getattr(state, "route_turn_angle_deg", 35.0) or 35.0)
+                if abs(float(d_deg)) > thr_deg:
+                    state.graph_freeze_enabled = True
+                    state.graph_freeze_s_m = float(s_j)
+                    state.graph_freeze_release = False
+                    state.graph_freeze_engaged = False
+
             print(
                 f"[TURN HINT] {turn}  j_id={j_id}  jdist={state.jdist:.1f}m  d={d_deg:.1f}deg  dist_px={dist_px:.1f}",
                 flush=True
             )
-            # гарантированная очистка после проезда (не зависит от road-follow)
-            pass_clear_m = float(getattr(state, "pass_clear_m", 1.0) or 1.0)
-            maybe_clear_turn_state(state, pass_clear_m=pass_clear_m)    
-    def maybe_clear_turn_state(state, pass_clear_m: float = 1.0) -> None:
-        """
-        Гарантированная очистка состояния поворота после прохождения junction.
-        Должна вызываться из update_junction_turn_hint() каждый тик.
-        """
-        active_s = getattr(state, "_active_turn_s_m", None)
-        if active_s is None:
+
+    # ==========================================================
+    # ВАЖНО: ЭТО ДОБАВИТЬ В КОНЕЦ update_junction_turn_hint()
+    # (после всех вычислений, перед выходом из функции)
+    # ==========================================================
+    pass_clear_m = float(getattr(state, "pass_clear_m", 1.0) or 1.0)
+    maybe_clear_turn_state(state, pass_clear_m=pass_clear_m)
+
+def maybe_clear_turn_state(state, pass_clear_m: float = 1.0) -> None:
+    """
+    Очистка состояния поворота после прохождения junction.
+    ВАЖНО: заморозка графа действует ТОЛЬКО в режиме меток.
+    """
+    active_s = getattr(state, "_active_turn_s_m", None)
+    if active_s is None:
+        return
+
+    # --- freeze ONLY for markers ---
+    if str(getattr(state, "nav_mode", "") or "") == "markers" and bool(getattr(state, "graph_freeze_enabled", False)):
+        # пока нет разрешения — не очищаем
+        if not bool(getattr(state, "graph_freeze_release", False)):
             return
+        # разрешили -> снимаем freeze
+        state.graph_freeze_enabled = False
+        state.graph_freeze_s_m = None
+        state.graph_freeze_engaged = False
+        state.graph_freeze_release = False
 
-        done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
-        if done_m < float(active_s) + float(pass_clear_m):
-            return
+    done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
+    if done_m < float(active_s) + float(pass_clear_m):
+        return
 
-        j_id = getattr(state, "_active_turn_j_id", None)
-        if getattr(state, "_turn_phase", None) is not None:
-            print(f"[TURN][PASSED]   j_id={j_id} done={done_m:.1f}m", flush=True)
+    j_id = getattr(state, "_active_turn_j_id", None)
+    if getattr(state, "_turn_phase", None) is not None:
+        print(f"[TURN][PASSED]   j_id={j_id} done={done_m:.1f}m", flush=True)
 
-        # --- turn hint ---
-        state.fturn = None
-        state._fturn_ts = None
+    state.fturn = None
+    state._fturn_ts = None
 
-        # --- camera turn debug ---
-        state.fturn_l = 0.0
-        state.fturn_c = 0.0
-        state.fturn_r = 0.0
+    state.fturn_l = 0.0
+    state.fturn_c = 0.0
+    state.fturn_r = 0.0
 
-        # --- active junction ---
-        state._active_turn_j_id = None
-        state._active_turn_s_m = None
-        state._turn_phase = None
+    state._active_turn_j_id = None
+    state._active_turn_s_m = None
+    state._turn_phase = None
 
-        # --- camera gating ---
-        state.cam_junc_seen = False
-        state.cam_junc_seen_ts = 0.0
-        state._cam_junc_last_seen_ts = 0.0
-        state._cam_junc_seen_lr = None
+    state.cam_junc_seen = False
+    state.cam_junc_seen_ts = 0.0
+    state._cam_junc_last_seen_ts = 0.0
+    state._cam_junc_seen_lr = None
 
-        # --- turn permission flags (для UI/road_follow) ---
-        state.turn_bias_allowed = False
-        state.turn_allowed = False
-        state.turn_execute = False
-    def maybe_clear_turn_state(state, pass_clear_m: float = 1.0) -> None:
-        """
-        Гарантированная очистка состояния поворота после прохождения junction.
-        Должна вызываться из update_junction_turn_hint() каждый тик.
-        """
-        active_s = getattr(state, "_active_turn_s_m", None)
-        if active_s is None:
-            return
-
-        done_m = float(getattr(state, "route_done_m", 0.0) or 0.0)
-        if done_m < float(active_s) + float(pass_clear_m):
-            return
-
-        j_id = getattr(state, "_active_turn_j_id", None)
-        if getattr(state, "_turn_phase", None) is not None:
-            print(f"[TURN][PASSED]   j_id={j_id} done={done_m:.1f}m", flush=True)
-
-        # --- turn hint ---
-        state.fturn = None
-        state._fturn_ts = None
-
-        # --- camera turn debug ---
-        state.fturn_l = 0.0
-        state.fturn_c = 0.0
-        state.fturn_r = 0.0
-
-        # --- active junction ---
-        state._active_turn_j_id = None
-        state._active_turn_s_m = None
-        state._turn_phase = None
-
-        # --- camera gating ---
-        state.cam_junc_seen = False
-        state.cam_junc_seen_ts = 0.0
-        state._cam_junc_last_seen_ts = 0.0
-        state._cam_junc_seen_lr = None
-
-        # --- turn permission flags (для UI/road_follow) ---
-        state.turn_bias_allowed = False
-        state.turn_allowed = False
-        state.turn_execute = False
+    state.turn_bias_allowed = False
+    state.turn_allowed = False
+    state.turn_execute = False

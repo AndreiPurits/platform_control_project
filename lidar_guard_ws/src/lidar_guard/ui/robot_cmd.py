@@ -15,7 +15,7 @@ PWM_MAX = 2000          # максимум
 
 # Табличная скорость (м/с) по PWM.
 SPEED_TABLE = {
-    1500: 0.01,
+    1500: 10.01,
     1550: 0.02,
     1600: 0.03,
     1650: 0.04,
@@ -64,7 +64,7 @@ def _clamp_servo_us(x: Optional[int]) -> int:
 
 def _pick_port() -> Optional[str]:
     #print(f"[HW] Arduino port resolved: {port}", flush=True)
-    return "/dev/serial/by-id/usb-FTDI_USB_Serial_Converter_FTB6SPL3-if00-port0"
+    return "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 
 
 def _serial_soft_close() -> None:
@@ -79,7 +79,35 @@ def _serial_soft_close() -> None:
     finally:
         _SER = None
         _SER_PORT = None
+def poll_arduino_startstop(on_toggle_cb):
+    """
+    Читает Serial от Arduino.
+    Ожидаемые строки:
+      START
+      STOP
+    """
+    global _SER
 
+    if _SER is None or not getattr(_SER, "is_open", False):
+        return
+
+    try:
+        while _SER.in_waiting:
+            line = _SER.readline().decode("ascii", errors="ignore").strip()
+            if not line:
+                continue
+
+            print(f"[ARDUINO->PC] {line}", flush=True)
+
+            if line == "START":
+                on_toggle_cb(True)
+
+            elif line == "STOP":
+                on_toggle_cb(False)
+
+    except Exception as e:
+        print("[ARDUINO] read error:", e, flush=True)
+        _serial_soft_close()
 
 def _ensure_serial() -> bool:
     """
@@ -131,47 +159,60 @@ def _ensure_serial() -> bool:
 
     except Exception as e:
         if time.time() - _LAST_FAIL_TS > 2.0:
-            #print(f"[ARDUINO] open fail {port}: {e}", flush=True)
+            print(f"[ARDUINO] open fail {port}: {e}", flush=True)
             _LAST_FAIL_TS = time.time()
         _serial_soft_close()
         return False
 
 
+_prev_send_ts = 0.0
+_KEEPALIVE_SEC = 0.10  # 100 мс (можно 0.05)
+
 def _send_m(l_us: int, r_us: int, b_us: int) -> None:
     """
-    Отправка команды на Arduino в СЕРВО-ФОРМАТЕ:
+    Отправка команды на Arduino:
       M L=<1000..2000> R=<1000..2000> B=<1000..2000>\n
-    При ошибке записи:
-      - закрываем порт
-      - в следующий вызов будет попытка переподключения
+
+    Важно:
+      - keepalive: даже если команда не изменилась, шлём раз в _KEEPALIVE_SEC
+      - при ошибке записи закрываем порт -> дальше сработает реконнект в _ensure_serial()
+      - печатаем отладку: что шлём и сколько байт записали
     """
-    global _prev_lrb, _LAST_SENT, _LAST_FAIL_TS
+    global _prev_lrb, _prev_send_ts, _LAST_SENT, _LAST_FAIL_TS
 
     l = _clamp_servo_us(l_us)
     r = _clamp_servo_us(r_us)
     b = _clamp_servo_us(b_us)
 
     triple = (l, r, b)
-    if triple == _prev_lrb:
-        # команда не изменилась — но всё равно полезно иногда слать "держание"
-        # здесь НЕ шлём повторно, чтобы не грузить систему
+    now = time.time()
+
+    # Шлём если изменилось ИЛИ прошло время keepalive
+    if triple == _prev_lrb and (now - _prev_send_ts) < _KEEPALIVE_SEC:
         return
-    _prev_lrb = triple
 
     if not _ensure_serial():
         return
 
     msg = f"M L={l} R={r} B={b}\n"
     try:
-        _SER.write(msg.encode("ascii", errors="ignore"))
-        _LAST_SENT = (l, r, b)
+        n = _SER.write(msg.encode("ascii", errors="ignore"))
+
+        _LAST_SENT = triple
+        _prev_lrb = triple
+        _prev_send_ts = now
+
+        # ---- DEBUG PRINT ----
+        # печатаем редко, чтобы не засорять лог (пример: 5 Гц)
+        # если хочешь чаще — убери условие
+        if (now - getattr(_send_m, "_last_dbg_ts", 0.0)) > 0.2:
+            _send_m._last_dbg_ts = now
+            #print(f"[ARDUINO] sent ({n}B) -> {msg.strip()}", flush=True)
+
     except Exception as e:
-        # ВАЖНО: при write error закрываем порт, дальше будет реконнект
-        #print(f"[ARDUINO] write error: {e} (port lost, will reconnect)", flush=True)
+        print(f"[ARDUINO] write error: {e}", flush=True)
         _LAST_FAIL_TS = time.time()
         _serial_soft_close()
-
-
 # ================== МОТОРЫ / ИНСТРУМЕНТ ==================
 def motors_set(state, l_pwm, r_pwm, b_pwm=None):
     """
@@ -198,7 +239,7 @@ def motors_set(state, l_pwm, r_pwm, b_pwm=None):
         b = _clamp_servo_us(b_pwm)
 
     try:
-        trim = int(getattr(state, "pwm_trim_lr", 0) or 0)
+        trim = int(getattr(state, "pwm_bias", 0) or 0)
     except Exception:
         trim = 0
 
@@ -334,8 +375,8 @@ def note_robot_pose(state, min_move_px: float = 3.0) -> None:
 
 
 def apply_start_defaults(state) -> None:
-    start_us = int(getattr(state, "drive_pwm_us", 1700) or 1700)
-    motors_set(state, start_us, start_us, PWM_NEUTRAL)
+    start_us = int(getattr(state, "drive_pwm_us", 1500) or 1500)
+    motors_set(state, start_us, start_us, state.b_pwm)
 
 
 # ================== HUD ==================

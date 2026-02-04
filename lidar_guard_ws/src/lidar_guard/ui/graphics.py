@@ -7,9 +7,56 @@ from status import set_indicator
 import math
 import os, json, time
 import cv2  
+import numpy as np
 
 Point = Tuple[float, float]
+def _save_lidar_snapshot(state, x_px, y_px):
+    """
+    Сохраняет последний лидарный кадр:
+    - JSON с точками
+    - PNG-превью (для визуальной отладки)
+    Возвращает (json_path, png_path) или None
+    """
+    pts = getattr(state, "_lidar_front_last_pts", None)
+    if not pts:
+        return None
 
+    photos_dir, lidar_dir = _dataset_dirs(state)
+
+    base = f"{int(x_px)}_{int(y_px)}"
+    json_path = os.path.join(lidar_dir, base + ".json")
+    png_path  = os.path.join(lidar_dir, base + ".png")
+
+    # --- JSON ---
+    try:
+        with open(json_path, "w") as f:
+            json.dump(
+                [{"x": float(x), "y": float(y)} for (x, y) in pts],
+                f,
+                indent=2
+            )
+    except Exception as e:
+        print("[LIDAR SAVE] json error:", e, flush=True)
+        json_path = None
+
+    # --- PNG preview ---
+    try:
+        img = np.zeros((512, 512, 3), dtype=np.uint8)
+        cx, cy = 256, 256
+        scale = 80.0  # м → px
+
+        for (x, y) in pts:
+            ix = int(cx + x * scale)
+            iy = int(cy - y * scale)
+            if 0 <= ix < 512 and 0 <= iy < 512:
+                img[iy, ix] = (0, 255, 255)
+
+        cv2.imwrite(png_path, img)
+    except Exception as e:
+        print("[LIDAR SAVE] png error:", e, flush=True)
+        png_path = None
+
+    return json_path, png_path
 # ---------- маркеры развилок ----------
 def _make_junction_dot() -> QtWidgets.QGraphicsEllipseItem:
     r = 4
@@ -208,143 +255,7 @@ def draw_flag(scene: QtWidgets.QGraphicsScene, pos_px, color: str = "#1e88e5"):
     return item
 
 # ---------- флаги / столкновение ----------
-def check_flags_crossed_and_update(
-    state,
-    p0_px,
-    p1_px,
-    eps_px: float = 8.0,
-    ui: Optional[QtWidgets.QMainWindow] = None,
-):
-    """Срабатывание КР-флажков при "скачке" позиции (snap).
 
-    Когда позиция robot_px дискретно корректируется, можно перепрыгнуть флаг.
-    Эта функция проверяет пересечение отрезком p0->p1 и применяет все
-    пересечённые флаги в правильном порядке (по t вдоль движения).
-    """
-    if not p0_px or not p1_px:
-        return
-
-    try:
-        x0, y0 = float(p0_px[0]), float(p0_px[1])
-        x1, y1 = float(p1_px[0]), float(p1_px[1])
-    except Exception:
-        return
-
-    # Список флагов и их типов
-    flags = list(getattr(state, "control_pts_px", []))
-    kinds = list(getattr(state, "control_pts_kind", []))
-    if not flags:
-        return
-
-    vx = x1 - x0
-    vy = y1 - y0
-    vv = vx * vx + vy * vy
-    if vv <= 1e-9:
-        # почти нет движения -> смысла проверять "пересечение" нет
-        return
-
-    eps2 = float(eps_px) * float(eps_px)
-
-    crossed = []  # (t, idx)
-    for i, pt in enumerate(flags):
-        try:
-            px, py = float(pt[0]), float(pt[1])
-        except Exception:
-            continue
-
-        # проекция точки на отрезок, параметр t в [0..1]
-        wx = px - x0
-        wy = py - y0
-        t = (wx * vx + wy * vy) / vv
-        if t < 0.0:
-            t_clamped = 0.0
-        elif t > 1.0:
-            t_clamped = 1.0
-        else:
-            t_clamped = t
-
-        # расстояние от точки до ближайшей точки на отрезке
-        cx = x0 + t_clamped * vx
-        cy = y0 + t_clamped * vy
-        dx = px - cx
-        dy = py - cy
-        d2 = dx * dx + dy * dy
-
-        if d2 <= eps2 and (0.0 <= t_clamped <= 1.0):
-            crossed.append((t_clamped, i))
-
-    if not crossed:
-        return
-
-    # Применяем в порядке движения
-    crossed.sort(key=lambda z: z[0])
-
-    # текущие PWM (L/R берём из state; B будем менять)
-    l = int(getattr(state, "l_pwm", 1500) or 1500)
-    r = int(getattr(state, "r_pwm", 1500) or 1500)
-
-    applied_any = False
-    to_remove = set()
-
-    for t, idx in crossed:
-        kind = kinds[idx] if idx < len(kinds) else None
-        pt = flags[idx]
-
-        # вычисляем PWM для B (как в check_flag_collision_and_update)
-        if kind == "b_on":
-            b_pwm = int(getattr(state, "b_on_pwm", 2000) or 2000)
-        elif kind == "b_off":
-            b_pwm = int(getattr(state, "b_off_pwm", 1500) or 1500)
-        else:
-            b_pwm = int(getattr(state, "b_pwm", 1500) or 1500)
-
-        state.b_pwm = b_pwm
-
-        try:
-            from robot_cmd import motors_set
-            motors_set(state, l, r, b_pwm)
-            print(f"[FLAG-X] crossed t={t:.3f} idx={idx} pt={pt} kind={kind!r} -> B={b_pwm}", flush=True)
-        except Exception as e:
-            print("[FLAG-X] motors_set B error:", e, flush=True)
-
-        applied_any = True
-        to_remove.add(idx)
-
-    if not applied_any:
-        return
-
-    # Удаляем сработавшие флаги (перестраиваем списки)
-    new_flags = []
-    new_kinds = []
-    for i, pt in enumerate(flags):
-        if i in to_remove:
-            continue
-        new_flags.append(pt)
-        if i < len(kinds):
-            new_kinds.append(kinds[i])
-
-    state.control_pts_px = new_flags
-    state.control_pts_kind = new_kinds
-
-    # Перерисовать маркеры, чтобы флаги исчезли
-    try:
-        from graphics import redraw_markers
-    except Exception:
-        redraw_markers = None
-
-    if redraw_markers:
-        for sc in (
-            getattr(state, "_idle_scene", None),
-            getattr(state, "_drive_scene", None),
-        ):
-            if sc is not None:
-                try:
-                    redraw_markers(state, sc)
-                except Exception:
-                    pass
-
-    if ui is not None and ui.statusBar():
-        ui.statusBar().showMessage("Сработал(и) флажок(и) КР (snap)", 1200)
 def check_flag_collision_and_update(
     state,
     eps_px: float = 8.0,
@@ -424,12 +335,6 @@ def check_flag_collision_and_update(
         print(f"[FLAG] apply B={b_pwm} (L={l}, R={r})", flush=True)
     except Exception as e:
         print("[FLAG] motors_set B error:", e, flush=True)
-
-    # Перерисовать маркеры, чтобы один флаг исчез, остальные остались со своими цветами
-    try:
-        from graphics import redraw_markers
-    except Exception:
-        redraw_markers = None
 
     if redraw_markers:
         for sc in (
@@ -617,10 +522,6 @@ LIDAR_SNAP_THRESHOLD = 0.85
 LIDAR_SNAP_PERCENT = 0.10
 LIDAR_SNAP_STEP_PX_DEF = 3.0
 
-# graphics.py
-import math
-from PyQt5 import QtWidgets
-from status import set_indicator
 
 def _lidar_check(pts, half_deg, R, Rmin, need_n, yaw0_rad) -> bool:
     half_rad = math.radians(max(0.0, min(179.9, half_deg)))
@@ -694,7 +595,6 @@ def lidar_sector_solidness(
     solidness = occupied_bins / float(sector_bins)
     return max(0.0, min(1.0, solidness))
 # -*- coding: utf-8 -*-
-import numpy as np
 
 
 def _front_sector_ranges(pts, *, half_deg: float, R: float, Rmin: float, yaw0_rad: float):
@@ -755,7 +655,72 @@ def _adaptive_cluster_max_frac(ranges_m, *, rel: float = 0.06, w_min: float = 0.
 
     return float(max_cnt) / float(n), int(max_cnt), int(n)
 
+def _advance_route_progress_by_v_dt(state, *, v: float, dt: float, Lm: float, Lpx: float, pts, interp_by_s_px):
+    """
+    ЕДИНСТВЕННОЕ место, где мы двигаем route_done_m/robot_px по скорости.
+    Возвращает True если достигли конца маршрута.
+    """
+    # --- clamp dt ---
+    if dt <= 0.0:
+        dt = 1e-3
+    dt = max(1e-3, min(float(dt), 0.2))
 
+    # --- meters-per-px (анизо уже учтён в route_len_m, поэтому alpha = Lm/Lpx) ---
+    alpha = float(getattr(state, "alpha_m_per_px", 1.0) or 1.0)
+    if alpha <= 1e-12:
+        alpha = (float(Lm) / float(Lpx)) if float(Lpx) > 1e-9 else 1.0
+        state.alpha_m_per_px = alpha
+
+    # --- carry in PX (как у тебя), но используем только здесь ---
+    carry_px = float(getattr(state, "_carry_step_px", 0.0) or 0.0)
+
+    # сколько пикселей нужно пройти за dt
+    step_px = (float(v) * float(dt)) / alpha + carry_px
+    if step_px < 0.0:
+        step_px = 0.0
+
+    # текущий прогресс в метрах
+    done_m_old = float(getattr(state, "route_done_m", 0.0) or 0.0)
+    done_m_new = done_m_old + float(v) * float(dt)
+    if done_m_new > float(Lm):
+        done_m_new = float(Lm)
+
+    # соответствующий прогресс в пикселях
+    s_px_old = (done_m_old / float(Lm)) * float(Lpx) if float(Lm) > 1e-9 else 0.0
+    s_px_new = s_px_old + step_px
+
+    # ВАЖНО: синхронизируем done_m_new с фактическим s_px_new, чтобы не было рассинхрона
+    # (и чтобы carry считался корректно)
+    if s_px_new >= float(Lpx) - 1e-6:
+        # конец
+        state.route_done_m = float(Lm)
+        state.route_progress_idx = max(0, len(pts) - 2)
+        state.robot_px = pts[-1]
+        # heading
+        try:
+            state.robot_heading_rad = math.atan2(pts[-1][1] - pts[-2][1], pts[-1][0] - pts[-2][0])
+        except Exception:
+            state.robot_heading_rad = 0.0
+        state._carry_step_px = 0.0
+        return True
+
+    # обычный шаг: интерполяция по s_px_new
+    i, x, y = interp_by_s_px(s_px_new)
+    state.route_progress_idx = int(i)
+    state.robot_px = (float(x), float(y))
+    ax, ay = pts[i]
+    bx, by = pts[i + 1]
+    state.robot_heading_rad = math.atan2(float(by) - float(ay), float(bx) - float(ax))
+
+    # done_m берём как done_m_new, но ограничим реальным s_px_new (через alpha)
+    # реальный шаг в px: s_px_new - s_px_old
+    exact_step_px = float(s_px_new) - float(s_px_old)
+    exact_step_m = exact_step_px * float(alpha)
+    state.route_done_m = min(float(Lm), done_m_old + exact_step_m)
+
+    # carry: что “переложили” в step_px сверх exact_step_px
+    state._carry_step_px = float(step_px) - float(exact_step_px)
+    return False
 def _hard_object_guard(ranges_m, *, hard_r: float = 1.15, hard_min_hits: int = 3):
     """
     Защита от твёрдого объекта при низкой общей плотности:
@@ -880,47 +845,6 @@ def lidar_rear_stop(ui, state) -> bool:
 def _lidar(ui, state):
     return lidar_front_stop(ui, state)
 
-def recompute_route_metrics(state):
-    pts_px = getattr(state, "route_pts_px", None) or []
-    if len(pts_px) < 2:
-        state.route_len_px = 0.0
-        state.route_len_m = 0.0
-        state.route_cum_px = [0.0]
-        state.alpha_m_per_px = 1.0
-        return False
-
-    Lpx = 0.0
-    cum = [0.0]
-    for a, b in zip(pts_px, pts_px[1:]):
-        d = math.hypot(b[0] - a[0], b[1] - a[1])
-        Lpx += d
-        cum.append(Lpx)
-
-    mx = float(getattr(state, "m_per_px_x", 0.0) or 0.0)
-    my = float(getattr(state, "m_per_px_y", 0.0) or 0.0)
-    if mx > 0.0 and my > 0.0:
-        Lm = 0.0
-        for a, b in zip(pts_px, pts_px[1:]):
-            dx, dy = (b[0] - a[0]), (b[1] - a[1])
-            Lm += math.hypot(dx * mx, dy * my)
-    else:
-        pts_m = getattr(state, "route_pts_m", None) or []
-        if len(pts_m) == len(pts_px) and len(pts_m) >= 2:
-            Lm = 0.0
-            for a, b in zip(pts_m, pts_m[1:]):
-                Lm += math.hypot(b[0] - a[0], b[1] - a[1])
-        else:
-            mpp = float(getattr(state, "meters_per_pixel", 0.0) or 0.0)
-            Lm = Lpx * (mpp if mpp > 0.0 else 1.0)
-
-    state.route_len_px = Lpx
-    state.route_len_m = Lm
-    state.route_cum_px = cum
-    state.alpha_m_per_px = (Lm / Lpx) if Lpx > 1e-9 else 1.0
-    state._carry_step_px = float(getattr(state, "_carry_step_px", 0.0) or 0.0)
-    return True
-
-
 # --------- старт анимации маршрута (движение по метрам) ----------
 
 
@@ -979,6 +903,45 @@ def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
         else:
             v = base_v
 
+        # ---------- TURN-GATE (ONLY markers) ----------
+        try:
+            if str(getattr(state, "nav_mode", "") or "") == "markers":
+                # по умолчанию — не заморожено (чтобы не залипало между тиками)
+                state.graph_freeze_engaged = False
+
+                if bool(getattr(state, "marker_turn_gate_enabled", True)):
+                    # ВАЖНО: "в обратную сторону не должно работать"
+                    # => если едем назад, gate не включаем
+                    try:
+                        from robot_cmd import get_speed
+                        cur_v = float(get_speed(state))
+                    except Exception:
+                        cur_v = float(getattr(state, "speed_mps", 0.0) or 0.0)
+
+                    if cur_v >= 0.0:
+                        if bool(getattr(state, "graph_freeze_enabled", False)):
+                            freeze_s = getattr(state, "graph_freeze_s_m", None)
+                            done = float(getattr(state, "route_done_m", 0.0) or 0.0)
+
+                            if isinstance(freeze_s, (int, float)):
+                                gate_before_m = float(getattr(state, "marker_turn_gate_before_m", 2.0) or 2.0)
+                                gate_before_m = max(0.2, min(10.0, gate_before_m))
+
+                                allow = bool(getattr(state, "graph_freeze_release", False)) \
+                                        or bool(getattr(state, "marker_turn_active", False)) \
+                                        or bool(getattr(state, "turn_execute", False))
+
+                                if (float(freeze_s) - done) <= gate_before_m and (not allow):
+                                    # ВАЖНО: стоп ТОЛЬКО ДЛЯ ГРАФА/ЛОКАЛИЗАЦИИ.
+                                    # ФИЗИЧЕСКИ ровер продолжает ехать (моторы не трогаем),
+                                    # иначе ты не выйдешь из пробуксовки/не дождёшься метки.
+                                    v = 0.0
+                                    state.graph_freeze_engaged = True
+                                else:
+                                    state.graph_freeze_engaged = False
+        except Exception as e:
+            print("[ANIM] turn-gate error:", e, flush=True)
+
         if v <= 1e-6:
             for sc in (getattr(state, "_idle_scene", None),
                        getattr(state, "_drive_scene", None)):
@@ -994,28 +957,32 @@ def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
                     pass
             return
 
+        # --- АНТИ-ДВОЙНОЙ ВЫЗОВ В ОДИН ТИК ---
         now = time.time()
-        last = float(getattr(state, "_last_route_tick_ts", now) or now)
-        dt = now - last
-        if dt <= 0:
+        last_exec = float(getattr(state, "_anim_last_exec_ts", 0.0) or 0.0)
+        if (now - last_exec) < 0.0005:  # 0.5ms
+            return
+        state._anim_last_exec_ts = now
+
+        # --- dt (ОДИН РАЗ) ---
+        last_tick = float(getattr(state, "_last_route_tick_ts", now) or now)
+        dt = now - last_tick
+        if dt <= 0.0:
             dt = state._route_timer.interval() / 1000.0
-        dt = max(1e-3, min(dt, 0.2))
+        dt = max(1e-3, min(float(dt), 0.2))
         state._last_route_tick_ts = now
 
-        alpha = float(getattr(state, "alpha_m_per_px", 1.0) or 1.0)
+        finished = _advance_route_progress_by_v_dt(
+            state,
+            v=v,
+            dt=dt,
+            Lm=Lm,
+            Lpx=Lpx,
+            pts=pts,
+            interp_by_s_px=_interp_by_s_px,
+        )
 
-        step_px = (v * dt) / alpha + float(getattr(state, "_carry_step_px", 0.0) or 0.0)
-
-        done_m_old = float(getattr(state, "route_done_m", 0.0) or 0.0)
-        s_px_old = (done_m_old / Lm) * Lpx
-        s_px_new = s_px_old + max(0.0, step_px)
-
-        if s_px_new >= Lpx - 1e-6:
-            state.route_done_m = Lm
-            state.route_progress_idx = len(pts) - 2
-            state.robot_px = pts[-1]
-            state.robot_heading_rad = math.atan2(pts[-1][1] - pts[-2][1],
-                                                 pts[-1][0] - pts[-2][0])
+        if finished:
             try:
                 if state._route_timer.isActive():
                     state._route_timer.stop()
@@ -1028,16 +995,6 @@ def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
                 btn.setText("Пуск")
             from routing import clear_goals_and_route
             clear_goals_and_route(state)
-        else:
-            i, x, y = _interp_by_s_px(s_px_new)
-            state.route_progress_idx = i
-            state.robot_px = (x, y)
-            ax, ay = pts[i]
-            bx, by = pts[i + 1]
-            state.robot_heading_rad = math.atan2(by - ay, bx - ax)
-            state.route_done_m = min(Lm, done_m_old + v * dt)
-            exact_step_px = (state.route_done_m / Lm) * Lpx - s_px_old
-            state._carry_step_px = (step_px - exact_step_px)
 
         if note_robot_pose:
             try:
@@ -1103,44 +1060,6 @@ def clear_route_visual(state, also_clear_data: bool = True):
         state.route_len_m = 0.0
         state.route_done_m = 0.0
     state.route_finished = True
-
-
-def update_visited_track(ui, state, min_seg_px: float = 2.0):
-    if not bool(getattr(state, "dataset_mode", False)):
-        return
-    rp = getattr(state, "robot_px", None)
-    if not rp:
-        return
-    pts = state.visited_path_px
-    if pts:
-        dx = rp[0] - pts[-1][0]
-        dy = rp[1] - pts[-1][1]
-        if (dx * dx + dy * dy) < (min_seg_px * min_seg_px):
-            return
-    pts.append((float(rp[0]), float(rp[1])))
-
-    sc = getattr(state, "_drive_scene", None)
-    if sc is None:
-        return
-    path = QtGui.QPainterPath()
-    if not pts:
-        return
-    path.moveTo(pts[0][0], pts[0][1])
-    for x, y in pts[1:]:
-        path.lineTo(x, y)
-    if state.drive_visited_item is None:
-        item = QtWidgets.QGraphicsPathItem(path)
-        pen = QtGui.QPen(QtGui.QColor("#22aa22"))
-        pen.setWidthF(2.0)
-        pen.setCosmetic(True)
-        item.setPen(pen)
-        item.setZValue(3)
-        sc.addItem(item)
-        state.drive_visited_item = item
-    else:
-        state.drive_visited_item.setPath(path)
-
-
 # ==== dataset capture (камера + лидар) ====
 
 def _dataset_dirs(state):
@@ -1192,125 +1111,6 @@ def _ensure_dataset_dirs(state):
     state.dataset_lidar_dir = lidar_dir
     return photos_dir, lidar_dir
 
-
-def _save_lidar_snapshot(state, x_px, y_px):
-    pts = getattr(state, "_lidar_last_pts", None) or []
-    if not pts:
-        return None
-
-    now_ms = int(time.time() * 1000)
-    last_ts = int(getattr(state, "_lidar_last_ts", 0))
-    if now_ms - last_ts > 1500:
-        return None
-
-    _, lidar_dir = _ensure_dataset_dirs(state)
-    base = f"{int(x_px)}_{int(y_px)}"
-    json_path = os.path.join(lidar_dir, base + ".json")
-    png_path = os.path.join(lidar_dir, base + ".png")
-
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"px": [int(x_px), int(y_px)], "ts_ms": now_ms, "pts": pts},
-                f, ensure_ascii=False, separators=(",", ":")
-            )
-    except Exception:
-        return None
-
-    try:
-        size = int(getattr(state, "lidar_png_size_px", 400) or 400)
-        rmax = float(getattr(state, "lidar_png_radius_m", 6.0) or 6.0)
-
-        img = QtGui.QImage(size, size, QtGui.QImage.Format_RGB32)
-        img.fill(QtGui.QColor("#0d1117"))
-
-        qp = QtGui.QPainter(img)
-        qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
-        pen_axes = QtGui.QPen(QtGui.QColor("#334155"))
-        pen_axes.setWidth(1)
-        pen_axes.setCosmetic(True)
-        cx = size * 0.5
-        cy = size * 0.5
-        qp.setPen(pen_axes)
-        qp.drawLine(0, int(cy), size, int(cy))
-        qp.drawLine(int(cx), 0, int(cx), size)
-
-        pen_grid = QtGui.QPen(QtGui.QColor("#1f2937"))
-        pen_grid.setWidth(1)
-        pen_grid.setCosmetic(True)
-        qp.setPen(pen_grid)
-        ppm = (size * 0.5 - 4.0) / max(0.1, rmax)
-        m = 1.0
-        while m <= rmax + 1e-9:
-            rad = m * ppm
-            qp.drawEllipse(QtCore.QPointF(cx, cy), rad, rad)
-            m += 1.0
-
-        pen_pts = QtGui.QPen(QtGui.QColor("#00bcd4"))
-        pen_pts.setWidth(0)
-        pen_pts.setCosmetic(True)
-        brush = QtGui.QBrush(QtGui.QColor("#00bcd4"))
-        qp.setPen(pen_pts)
-        qp.setBrush(brush)
-        d = 2.0
-        for (xm, ym) in pts:
-            xp = cx + xm * ppm
-            yp = cy - ym * ppm
-            qp.drawEllipse(QtCore.QRectF(xp - d, yp - d, 2 * d, 2 * d))
-
-        qp.end()
-
-        if not img.save(png_path, "PNG"):
-            png_path = None
-    except Exception:
-        png_path = None
-
-    return (os.path.abspath(json_path), os.path.abspath(png_path) if png_path else None)
-
-
-def dataset_maybe_capture(ui: QtWidgets.QMainWindow, state):
-    if not getattr(state, "dataset_mode", False):
-        return
-    if not getattr(state, "is_running", False):
-        return
-
-    Lm = float(getattr(state, "route_len_m", 0.0) or 0.0)
-    done = float(getattr(state, "route_done_m", 0.0) or 0.0)
-    if Lm <= 0.0:
-        return
-
-    step = float(getattr(state, "dataset_step_m", 3.0) or 3.0)
-    last = float(getattr(state, "dataset_last_snap_m", 0.0) or 0.0)
-    if (done - last) < step:
-        return
-
-    rp = getattr(state, "robot_px", None)
-    if not rp:
-        return
-    x_px, y_px = float(rp[0]), float(rp[1])
-
-    _ensure_dataset_dirs(state)
-
-    saved_parts = []
-
-    lid = _save_lidar_snapshot(state, x_px, y_px)
-    if lid:
-        jp, pp = lid
-        if jp:
-            saved_parts.append(f"lidar-json -> {jp}")
-        if pp:
-            saved_parts.append(f"lidar-png  -> {pp}")
-
-    cam = _save_camera_frame(state, x_px, y_px)
-    if cam:
-        saved_parts.append(f"photo -> {cam}")
-
-    if saved_parts:
-        state.dataset_last_snap_m = done
-        print(f"[CAPTURE] done={done:.1f} m @ ({int(x_px)},{int(y_px)}) | " + ", ".join(saved_parts), flush=True)
-
-
 def _apply_combined_safety(ui, state):
     """
     Обновляет state.safety_stop и HUD в зависимости от направления движения:
@@ -1325,123 +1125,6 @@ def _apply_combined_safety(ui, state):
 
     state.safety_stop = combined
     set_safety_stop(ui, combined, state)  # тут и motors_stop, и "ПРЕПЯТСТВИЕ"
-def _front_sector_ranges(pts, *, half_deg: float, R: float, Rmin: float, yaw0_rad: float):
-    """
-    pts: list[(x_m,y_m)] в координатах лидара/робота.
-    yaw0_rad: компенсируем поворот лидара (если нужно).
-    Возвращает список дальностей r (м) в секторе +/- half_deg и диапазоне (Rmin, R].
-    """
-    if not pts:
-        return []
-
-    half = float(half_deg) * math.pi / 180.0
-    out = []
-    for (x, y) in pts:
-        x = float(x); y = float(y)
-        r = math.hypot(x, y)
-        if r <= float(Rmin) or r > float(R):
-            continue
-
-        a = math.atan2(y, x) - float(yaw0_rad)
-        while a > math.pi:  a -= 2.0 * math.pi
-        while a < -math.pi: a += 2.0 * math.pi
-        if abs(a) > half:
-            continue
-
-        out.append(r)
-    return out
-
-
-def _adaptive_cluster_max_frac(ranges_m, *, rel: float = 0.06, w_min: float = 0.03):
-    """
-    1D кластеризация по дальности:
-      - сортируем r
-      - объединяем если соседние <= max(w_min, rel*r_ref)
-    Возвращает (max_cluster_frac, max_cluster_cnt, n_total)
-    """
-    n = len(ranges_m)
-    if n == 0:
-        return 0.0, 0, 0
-
-    rs = np.sort(np.asarray(ranges_m, dtype=np.float32))
-    max_cnt = 1
-    cnt = 1
-    r_ref = float(rs[0])
-
-    for i in range(1, n):
-        thr_w = max(float(w_min), float(rel) * max(0.01, r_ref))
-        if float(rs[i]) - float(rs[i - 1]) <= thr_w:
-            cnt += 1
-        else:
-            if cnt > max_cnt:
-                max_cnt = cnt
-            cnt = 1
-            r_ref = float(rs[i])
-
-    if cnt > max_cnt:
-        max_cnt = cnt
-
-    return float(max_cnt) / float(n), int(max_cnt), int(n)
-
-
-def _hard_object_guard(ranges_m, *, hard_r: float = 1.15, hard_min_hits: int = 3):
-    """
-    Защита от твёрдого объекта при низкой общей плотности:
-    если есть компактный кластер ближе hard_r (например ствол).
-    """
-    near = [r for r in ranges_m if float(r) <= float(hard_r)]
-    if len(near) < int(hard_min_hits):
-        return False, 0
-    _, cnt, _ = _adaptive_cluster_max_frac(near, rel=0.02, w_min=0.02)
-    return (cnt >= int(hard_min_hits)), int(cnt)
-
-def lidar_rear_stop(ui, state) -> bool:
-    
-    # если заднего лидара нет — всегда зелёная лампа и нет стопа
-    if not getattr(state, "has_rear_lidar", False):
-        try:
-            indR = ui.findChild(QtWidgets.QLabel, "indLidarRear")
-            if indR:
-                set_indicator(indR, "ok")
-        except Exception:
-            pass
-        state.safety_stop_rear = False
-        _apply_combined_safety(ui, state)
-        return False
-
-    pts = getattr(state, "_lidar_rear_last_pts", None) or []
-
-    stop = _lidar_check(
-        pts=pts,
-        half_deg=float(getattr(state, "lidar_rear_sector_half_deg", 25.0) or 25.0),
-        R=float(getattr(state, "lidar_rear_stop_distance_m", 1) or 1),
-        Rmin=float(getattr(state, "lidar_rear_ignore_radius_m", 0.01) or 0.01),
-        need_n=int(getattr(state, "lidar_rear_stop_min_points", 3) or 3),
-        yaw0_rad=float(getattr(state, "lidar_rear_mount_yaw_rad", 3.0) or 3.0),
-    )
-
-    prev = bool(getattr(state, "safety_stop_rear", False))
-    state.safety_stop_rear = stop
-
-    # Лампа заднего лидара
-    try:
-        indR = ui.findChild(QtWidgets.QLabel, "indLidarRear")
-        if indR:
-            set_indicator(indR, "bad" if stop else "ok")
-    except Exception:
-        pass
-
-    _apply_combined_safety(ui, state)
-
-    if stop and not prev:
-        print("[LIDAR REAR STOP] triggered", flush=True)
-    if (not stop) and prev:
-        print("[LIDAR REAR STOP] cleared", flush=True)
-
-    return stop
-
-def _lidar(ui, state):
-    return lidar_front_stop(ui, state)
 
 def recompute_route_metrics(state):
     pts_px = getattr(state, "route_pts_px", None) or []
@@ -1481,192 +1164,42 @@ def recompute_route_metrics(state):
     state.route_cum_px = cum
     state.alpha_m_per_px = (Lm / Lpx) if Lpx > 1e-9 else 1.0
     state._carry_step_px = float(getattr(state, "_carry_step_px", 0.0) or 0.0)
+
+    # ---------- NEW: точки поворота на маршруте (в метрах по маршруту) ----------
+    # считаем "поворотом" место, где угол между сегментами > turn_angle_deg
+    turn_angle_deg = float(getattr(state, "route_turn_angle_deg", 35.0) or 35.0)
+    turn_angle_deg = max(5.0, min(120.0, turn_angle_deg))
+    turn_cos_thr = math.cos(math.radians(turn_angle_deg))
+
+    # turn points in px-cum; потом переводим в meters (через alpha)
+    turn_s_px = []
+    for i in range(1, len(pts_px) - 1):
+        ax, ay = pts_px[i - 1]
+        bx, by = pts_px[i]
+        cx, cy = pts_px[i + 1]
+        v1x, v1y = (bx - ax), (by - ay)
+        v2x, v2y = (cx - bx), (cy - by)
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+        coss = (v1x * v2x + v1y * v2y) / (n1 * n2)
+        # если угол большой => cos маленький
+        if coss < turn_cos_thr:
+            # cum[i] — это s_px в точке B (узел)
+            turn_s_px.append(float(cum[i]))
+
+    # дедуп (рядом стоящие точки в пределах 10px считаем одним поворотом)
+    turn_s_px_sorted = sorted(turn_s_px)
+    merged = []
+    for s in turn_s_px_sorted:
+        if not merged or abs(s - merged[-1]) > 10.0:
+            merged.append(s)
+
+    alpha = float(state.alpha_m_per_px or 1.0)
+    state.route_turn_m = [float(s) * alpha for s in merged]
+
     return True
-
-
-# --------- старт анимации маршрута (движение по метрам) ----------
-
-
-def start_route_animation(ui: QtWidgets.QMainWindow, state, fps: int = 30):
-    pts = getattr(state, "route_pts_px", None) or []
-    if len(pts) < 2 or float(getattr(state, "route_len_m", 0.0) or 0.0) <= 0.0:
-        print("[ANIM] нет маршрута", flush=True)
-        return False
-
-    if not hasattr(state, "_route_timer") or state._route_timer is None:
-        state._route_timer = QtCore.QTimer(ui)
-    state._route_timer.setInterval(max(1, int(1000 / fps)))
-
-    Lm = float(state.route_len_m)
-    Lpx = float(state.route_len_px)
-    if getattr(state, "route_done_m", 0.0) > Lm:
-        state.route_done_m = Lm
-    if getattr(state, "route_progress_idx", 0) >= len(pts) - 1:
-        state.route_progress_idx = len(pts) - 2
-
-    state._last_route_tick_ts = time.time()
-    state._carry_step_px = float(getattr(state, "_carry_step_px", 0.0) or 0.0)
-
-    def _interp_by_s_px(s_px: float):
-        cum = state.route_cum_px
-        i = 0
-        while i < len(cum) - 1 and cum[i + 1] < s_px:
-            i += 1
-        i = min(i, len(pts) - 2)
-        seg_len = max(1e-9, cum[i + 1] - cum[i])
-        t = (s_px - cum[i]) / seg_len
-        ax, ay = pts[i]
-        bx, by = pts[i + 1]
-        return i, ax + t * (bx - ax), ay + t * (by - ay)
-
-    def _tick():
-        try:
-            from robot_cmd import update_drive_panel, note_robot_pose
-        except Exception:
-            update_drive_panel = None
-            note_robot_pose = None
-
-        base_v = float(getattr(state, "speed_mps", 0.0) or 0.0)
-
-        lidar_stop = False
-        try:
-            lidar_stop = bool(_lidar(ui, state))
-        except Exception as e:
-            print("[ANIM] lidar check error:", e, flush=True)
-            lidar_stop = False
-
-        road_block = False  # TODO: road_guard сюда же, когда включишь
-
-        if lidar_stop or road_block:
-            v = 0.0
-        else:
-            v = base_v
-
-        if v <= 1e-6:
-            for sc in (getattr(state, "_idle_scene", None),
-                       getattr(state, "_drive_scene", None)):
-                if sc is not None:
-                    try:
-                        redraw_markers(state, sc)
-                    except Exception:
-                        pass
-            if update_drive_panel:
-                try:
-                    update_drive_panel(ui, state)
-                except Exception:
-                    pass
-            return
-
-        now = time.time()
-        last = float(getattr(state, "_last_route_tick_ts", now) or now)
-        dt = now - last
-        if dt <= 0:
-            dt = state._route_timer.interval() / 1000.0
-        dt = max(1e-3, min(dt, 0.2))
-        state._last_route_tick_ts = now
-
-        alpha = float(getattr(state, "alpha_m_per_px", 1.0) or 1.0)
-
-        step_px = (v * dt) / alpha + float(getattr(state, "_carry_step_px", 0.0) or 0.0)
-
-        done_m_old = float(getattr(state, "route_done_m", 0.0) or 0.0)
-        s_px_old = (done_m_old / Lm) * Lpx
-        s_px_new = s_px_old + max(0.0, step_px)
-
-        if s_px_new >= Lpx - 1e-6:
-            state.route_done_m = Lm
-            state.route_progress_idx = len(pts) - 2
-            state.robot_px = pts[-1]
-            state.robot_heading_rad = math.atan2(pts[-1][1] - pts[-2][1],
-                                                 pts[-1][0] - pts[-2][0])
-            try:
-                if state._route_timer.isActive():
-                    state._route_timer.stop()
-            except Exception:
-                pass
-            state.is_running = False
-            btn = ui.findChild(QtWidgets.QPushButton, "btnStartStop")
-            if btn:
-                btn.setChecked(False)
-                btn.setText("Пуск")
-            from routing import clear_goals_and_route
-            clear_goals_and_route(state)
-        else:
-            i, x, y = _interp_by_s_px(s_px_new)
-            state.route_progress_idx = i
-            state.robot_px = (x, y)
-            ax, ay = pts[i]
-            bx, by = pts[i + 1]
-            state.robot_heading_rad = math.atan2(by - ay, bx - ax)
-            state.route_done_m = min(Lm, done_m_old + v * dt)
-            exact_step_px = (state.route_done_m / Lm) * Lpx - s_px_old
-            state._carry_step_px = (step_px - exact_step_px)
-
-        if note_robot_pose:
-            try:
-                note_robot_pose(state)
-            except Exception as e:
-                print("[ROBOT] note_robot_pose error:", e, flush=True)
-
-        try:
-            update_visited_track(ui, state)
-            dataset_maybe_capture(ui, state)
-        except Exception as e:
-            print("[ANIM] aux error:", e, flush=True)
-
-        for sc in (getattr(state, "_idle_scene", None),
-                   getattr(state, "_drive_scene", None)):
-            if sc is not None:
-                try:
-                    redraw_markers(state, sc)
-                except Exception:
-                    pass
-        if update_drive_panel:
-            try:
-                update_drive_panel(ui, state)
-            except Exception:
-                pass
-
-    try:
-        state._route_timer.timeout.disconnect()
-    except (TypeError, RuntimeError):
-        pass
-    state._route_timer.timeout.connect(_tick)
-    if not state._route_timer.isActive():
-        state._route_timer.start()
-    return True
-
-
-def stop_route_animation(state, keep_progress: bool = True):
-    try:
-        if hasattr(state, "_route_timer") and state._route_timer and state._route_timer.isActive():
-            state._route_timer.stop()
-    except Exception:
-        pass
-    if not keep_progress:
-        state.route_progress_idx = 0
-        state.route_seg_off_m = 0.0
-
-
-def clear_route_visual(state, also_clear_data: bool = True):
-    for attr_item, attr_scene in (("idle_route_item", "_idle_scene"),
-                                  ("drive_route_item", "_drive_scene")):
-        item = getattr(state, attr_item, None)
-        sc = getattr(state, attr_scene, None)
-        if item and sc and item.scene() is sc:
-            try:
-                sc.removeItem(item)
-            except Exception:
-                pass
-        setattr(state, attr_item, None)
-
-    if also_clear_data:
-        state.route_pts_px = []
-        state.route_pts_m = []
-        state.route_len_m = 0.0
-        state.route_done_m = 0.0
-    state.route_finished = True
-
 
 def update_visited_track(ui, state, min_seg_px: float = 2.0):
     if not bool(getattr(state, "dataset_mode", False)):
@@ -1702,134 +1235,6 @@ def update_visited_track(ui, state, min_seg_px: float = 2.0):
         state.drive_visited_item = item
     else:
         state.drive_visited_item.setPath(path)
-
-
-# ==== dataset capture (камера + лидар) ====
-
-def _dataset_dirs(state):
-    map_path = getattr(state, "active_map_path", None) or "map"
-    map_name = os.path.splitext(os.path.basename(map_path))[0]
-    root = getattr(state, "dataset_root", os.path.expanduser("~/datasets"))
-    photos_dir = os.path.join(root, "photos", map_name)
-    lidar_dir = os.path.join(root, "lidar", map_name)
-    os.makedirs(photos_dir, exist_ok=True)
-    os.makedirs(lidar_dir, exist_ok=True)
-    return photos_dir, lidar_dir
-
-
-def _save_camera_frame(state, x_px, y_px):
-    cap = getattr(state, "_cam", None)
-    if cap is None or not cap.isOpened():
-        return None
-
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        return None
-
-    photos_dir, _ = _dataset_dirs(state)
-    fname = f"{int(x_px)}_{int(y_px)}.png"
-    path = os.path.join(photos_dir, fname)
-
-    try:
-        if cv2.imwrite(path, frame):
-            return os.path.abspath(path)
-    except Exception as e:
-        print("[CAMERA SAVE] error:", e, flush=True)
-    return None
-
-def _ensure_dataset_dirs(state):
-    root = getattr(state, "dataset_root", os.path.expanduser("~/datasets")) or os.path.expanduser("~/datasets")
-    map_path = getattr(state, "active_map_path", None)
-    if not map_path:
-        map_name = "unnamed_map"
-    else:
-        map_name = os.path.splitext(os.path.basename(map_path))[0]
-    state.map_name = map_name
-
-    photos_dir = os.path.join(root, "photos", map_name)
-    lidar_dir = os.path.join(root, "lidar", map_name)
-    os.makedirs(photos_dir, exist_ok=True)
-    os.makedirs(lidar_dir, exist_ok=True)
-
-    state.dataset_photos_dir = photos_dir
-    state.dataset_lidar_dir = lidar_dir
-    return photos_dir, lidar_dir
-
-
-def _save_lidar_snapshot(state, x_px, y_px):
-    pts = getattr(state, "_lidar_last_pts", None) or []
-    if not pts:
-        return None
-
-    now_ms = int(time.time() * 1000)
-    last_ts = int(getattr(state, "_lidar_last_ts", 0))
-    if now_ms - last_ts > 1500:
-        return None
-
-    _, lidar_dir = _ensure_dataset_dirs(state)
-    base = f"{int(x_px)}_{int(y_px)}"
-    json_path = os.path.join(lidar_dir, base + ".json")
-    png_path = os.path.join(lidar_dir, base + ".png")
-
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"px": [int(x_px), int(y_px)], "ts_ms": now_ms, "pts": pts},
-                f, ensure_ascii=False, separators=(",", ":")
-            )
-    except Exception:
-        return None
-
-    try:
-        size = int(getattr(state, "lidar_png_size_px", 400) or 400)
-        rmax = float(getattr(state, "lidar_png_radius_m", 6.0) or 6.0)
-
-        img = QtGui.QImage(size, size, QtGui.QImage.Format_RGB32)
-        img.fill(QtGui.QColor("#0d1117"))
-
-        qp = QtGui.QPainter(img)
-        qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
-        pen_axes = QtGui.QPen(QtGui.QColor("#334155"))
-        pen_axes.setWidth(1)
-        pen_axes.setCosmetic(True)
-        cx = size * 0.5
-        cy = size * 0.5
-        qp.setPen(pen_axes)
-        qp.drawLine(0, int(cy), size, int(cy))
-        qp.drawLine(int(cx), 0, int(cx), size)
-
-        pen_grid = QtGui.QPen(QtGui.QColor("#1f2937"))
-        pen_grid.setWidth(1)
-        pen_grid.setCosmetic(True)
-        qp.setPen(pen_grid)
-        ppm = (size * 0.5 - 4.0) / max(0.1, rmax)
-        m = 1.0
-        while m <= rmax + 1e-9:
-            rad = m * ppm
-            qp.drawEllipse(QtCore.QPointF(cx, cy), rad, rad)
-            m += 1.0
-
-        pen_pts = QtGui.QPen(QtGui.QColor("#00bcd4"))
-        pen_pts.setWidth(0)
-        pen_pts.setCosmetic(True)
-        brush = QtGui.QBrush(QtGui.QColor("#00bcd4"))
-        qp.setPen(pen_pts)
-        qp.setBrush(brush)
-        d = 2.0
-        for (xm, ym) in pts:
-            xp = cx + xm * ppm
-            yp = cy - ym * ppm
-            qp.drawEllipse(QtCore.QRectF(xp - d, yp - d, 2 * d, 2 * d))
-
-        qp.end()
-
-        if not img.save(png_path, "PNG"):
-            png_path = None
-    except Exception:
-        png_path = None
-
-    return (os.path.abspath(json_path), os.path.abspath(png_path) if png_path else None)
 
 
 def dataset_maybe_capture(ui: QtWidgets.QMainWindow, state):
@@ -1872,19 +1277,3 @@ def dataset_maybe_capture(ui: QtWidgets.QMainWindow, state):
     if saved_parts:
         state.dataset_last_snap_m = done
         print(f"[CAPTURE] done={done:.1f} m @ ({int(x_px)},{int(y_px)}) | " + ", ".join(saved_parts), flush=True)
-
-
-def _apply_combined_safety(ui, state):
-    """
-    Обновляет state.safety_stop и HUD в зависимости от направления движения:
-    - если едем вперёд (скорость >= 0) → учитываем только front
-    - если едем назад (скорость < 0)   → учитываем только rear
-    """
-    v = get_speed(state)  # уже возвращает отрицательную скорость при заднем ходе
-    if v >= 0:
-        combined = bool(getattr(state, "safety_stop_front", False))
-    else:
-        combined = bool(getattr(state, "safety_stop_rear", False))
-
-    state.safety_stop = combined
-    set_safety_stop(ui, combined, state)  # тут и motors_stop, и "ПРЕПЯТСТВИЕ"

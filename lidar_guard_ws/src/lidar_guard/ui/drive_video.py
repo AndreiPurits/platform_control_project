@@ -86,6 +86,11 @@ class VideoController(QtCore.QObject):
         self._fps_n = 0
         self._fps_val = 0.0
 
+        # --- telemetry timer (independent from camera) ---
+        self._telem_timer = QtCore.QTimer(self.ui)
+        self._telem_timer.setInterval(200)  # 5 Гц, достаточно
+        self._telem_timer.timeout.connect(self._update_telem_labels)
+        self._telem_timer.start()
         # EMA for road_bin
         self._rb_ema_small = None
 
@@ -96,7 +101,20 @@ class VideoController(QtCore.QObject):
         self._aruco_last_ts = 0.0
         self._aruco_waiting = False
         self._aruco_send_ts = 0.0
+        self._aruco_last_send_wall = 0.0
 
+        # --- ROI search mode state ---
+        self._aruco_search_mode = "scan"     # стартуем с дальняка: скан по кропам
+        self._aruco_last_xy = None           # (cx_full, cy_full)
+        self._aruco_last_roi = None          # (x0,y0,w,h) последняя ROI отправка
+
+        # scan state
+        self._aruco_scan_x0 = 0
+        self._aruco_scan_dir = +1
+        self._aruco_miss_cnt = 0
+        self._aruco_full_seen_t0 = None   # когда начали стабильно видеть в FULL
+        self._aruco_track_lost_t0 = None  # когда начали терять в TRACK
+        self._aruco_full_hold_t0 = None
         # phone stream (optional)
         self._phone_srv = None
         self._phone_enabled = False
@@ -258,7 +276,7 @@ class VideoController(QtCore.QObject):
                 print("[CALIB] not found:", calib_path, flush=True)
 
             if not hasattr(st, "marker_len_m") or float(getattr(st, "marker_len_m", 0.0) or 0.0) <= 1e-6:
-                st.marker_len_m = 0.178  # твои печатные метки
+                st.marker_len_m = 0.173  # твои печатные метки
 
             print("[CALIB] marker_len_m:", float(st.marker_len_m), flush=True)
         except Exception as e:
@@ -471,49 +489,131 @@ class VideoController(QtCore.QObject):
     # ============================================================
     # ArUco detect (non-blocking IPC)
     # ============================================================
-
     def _detect_aruco(self, frame_bgr):
         st = self.state
 
-        if self._aruco_proc is None or (not self._aruco_proc.is_alive()) or (self._aruco_conn is None):
+        if self._aruco_proc is None or not self._aruco_proc.is_alive():
             self._start_aruco_worker()
-            if self._aruco_conn is None:
-                return None
+            return None
 
         now = time.monotonic()
 
-        # 1) non-blocking receive
+        # -----------------------------
+        # time params
+        # -----------------------------
+        track_lost_s = float(getattr(st, "aruco_track_lost_s", 3.0) or 3.0)
+
+        # когда считаем, что "уже близко" и можно переключаться в FULL
+        # критерий — площадь corners (в FULL координатах)
+        full_area_thr = float(getattr(st, "aruco_full_area_thr", 9000.0) or 9000.0)
+        full_hold_s   = float(getattr(st, "aruco_full_hold_s", 0.20) or 0.20)
+
+        # -----------------------------
+        # recv (non-blocking)
+        # -----------------------------
+        got_new = False
+        res = None
         try:
             if self._aruco_conn.poll(0.0):
                 res = self._aruco_conn.recv()
-                self._aruco_last = res
-                self._aruco_last_ts = now
-                self._aruco_waiting = False
-        except Exception as e:
-            print("[ARUCO] poll/recv error:", e, flush=True)
-            self._aruco_last = None
-            self._aruco_last_ts = 0.0
-            self._aruco_waiting = False
-            return None
+                got_new = True
+        except Exception:
+            res = None
+            got_new = True
 
-        # 2) already waiting -> do not send new request
-        if self._aruco_waiting:
+        if got_new:
+            self._aruco_last = res
+            self._aruco_last_ts = now
+
+            # helper: shift ROI coords -> FULL coords
+            def _shift_to_full(mi, roi):
+                if roi is None:
+                    return mi
+                x0, y0, _, _ = roi
+                mi = dict(mi)
+                mi["cx"] = float(mi.get("cx", 0.0)) + float(x0)
+                mi["cy"] = float(mi.get("cy", 0.0)) + float(y0)
+                cc = mi.get("corners", None)
+                if cc and len(cc) == 4:
+                    out = []
+                    for p in cc:
+                        out.append([float(p[0]) + float(x0), float(p[1]) + float(y0)])
+                    mi["corners"] = out
+                return mi
+
+            # normalize + shift to FULL
+            if res is not None:
+                if isinstance(res, dict):
+                    self._aruco_last = _shift_to_full(res, self._aruco_last_roi)
+                elif isinstance(res, (list, tuple)):
+                    tmp = []
+                    for x in res:
+                        if isinstance(x, dict):
+                            tmp.append(_shift_to_full(x, self._aruco_last_roi))
+                    self._aruco_last = tmp
+
+            # update last_xy + area
+            found = (self._aruco_last is not None)
+            if found:
+                self._aruco_track_lost_t0 = None
+
+                # take first marker
+                mi0 = None
+                if isinstance(self._aruco_last, dict):
+                    mi0 = self._aruco_last
+                elif isinstance(self._aruco_last, (list, tuple)) and self._aruco_last:
+                    mi0 = self._aruco_last[0]
+
+                if isinstance(mi0, dict):
+                    try:
+                        self._aruco_last_xy = (float(mi0.get("cx", 0.0)), float(mi0.get("cy", 0.0)))
+                    except Exception:
+                        pass
+
+                    # compute marker area from corners in FULL coords
+                    area = 0.0
+                    try:
+                        cc = mi0.get("corners", None)
+                        if cc and len(cc) == 4:
+                            c32 = np.array(cc, dtype=np.float32).reshape(-1, 2)
+                            area = float(cv2.contourArea(c32))
+                    except Exception:
+                        area = 0.0
+
+                    # decide "close enough" -> switch to FULL (but require small hold to avoid flicker)
+                    if area >= full_area_thr:
+                        if self._aruco_full_hold_t0 is None:
+                            self._aruco_full_hold_t0 = now
+                        elif (now - float(self._aruco_full_hold_t0)) >= full_hold_s:
+                            self._aruco_search_mode = "full"
+                            self._aruco_last_roi = None
+                    else:
+                        self._aruco_full_hold_t0 = None
+                        # если нашли в scan -> сразу в track
+                        if self._aruco_search_mode == "scan":
+                            self._aruco_search_mode = "track"
+            else:
+                self._aruco_full_hold_t0 = None
+                # miss handling for TRACK only
+                if self._aruco_search_mode == "track":
+                    if self._aruco_track_lost_t0 is None:
+                        self._aruco_track_lost_t0 = now
+                    elif (now - float(self._aruco_track_lost_t0)) >= track_lost_s:
+                        # потеряли 3 секунды -> обратно в scan
+                        self._aruco_search_mode = "scan"
+                        self._aruco_track_lost_t0 = None
+                        self._aruco_last_xy = None
+                        self._aruco_last_roi = None
+
+        # -----------------------------
+        # send (rate-limited)
+        # -----------------------------
+        send_period = float(getattr(st, "aruco_send_period_s", 0.06) or 0.06)
+        if (now - float(getattr(self, "_aruco_last_send_wall", 0.0))) < send_period:
             return self._aruco_last
 
-        # 3) rate limit
-        req_dt = float(getattr(st, "aruco_req_dt", 0.08) or 0.08)
-        req_dt = _clamp(req_dt, 0.010, 0.200)
-        if (now - float(self._aruco_send_ts or 0.0)) < req_dt:
-            return self._aruco_last
-
-        # 4) encode jpeg
-        frame_bgr = np.ascontiguousarray(frame_bgr)
-        if frame_bgr.dtype != np.uint8:
-            frame_bgr = frame_bgr.astype(np.uint8, copy=False)
-
-        ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ok:
-            return self._aruco_last
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        H, W = gray.shape[:2]
 
         wanted_ids = [
             int(getattr(st, "aruco_id_straight_right_pole", 10) or 10),
@@ -521,30 +621,153 @@ class VideoController(QtCore.QObject):
             int(getattr(st, "aruco_id_turn_right", 20) or 20),
             int(getattr(st, "aruco_id_turn_left", 30) or 30),
         ]
-        marker_len_m = float(getattr(st, "marker_len_m", 0.178) or 0.178)
+        marker_len_m = float(getattr(st, "marker_len_m", 0.173) or 0.173)
 
-        K = getattr(st, "cam_K", None)
-        D = getattr(st, "cam_D", None)
-        if K is not None:
-            K = np.ascontiguousarray(K, dtype=np.float64)
-        if D is not None:
-            D = np.ascontiguousarray(D, dtype=np.float64)
+        # -----------------------------
+        # choose image to send
+        # -----------------------------
+        mode = str(getattr(self, "_aruco_search_mode", "scan") or "scan")
 
-        downscale = int(getattr(st, "aruco_downscale", 1) or 1)
+        # intrinsics
+        K0 = getattr(st, "cam_K", None)
+        D0 = getattr(st, "cam_D", None)
+
+        img_send = gray
+        K_send = K0
+        D_send = D0
+        self._aruco_last_roi = None
+
+        if mode == "full":
+            # FULL_BAND: ищем только в "полосе", как в scan
+            top_frac = float(getattr(st, "aruco_scan_top_frac", 0.20) or 0.20)
+            bot_frac = float(getattr(st, "aruco_scan_bot_frac", 0.30) or 0.30)
+            top_frac = float(_clamp(top_frac, 0.0, 0.45))
+            bot_frac = float(_clamp(bot_frac, 0.0, 0.45))
+
+            y0_band = int(H * top_frac)
+            y1_band = int(H * (1.0 - bot_frac))
+            y0_band = int(_clamp(y0_band, 0, H - 2))
+            y1_band = int(_clamp(y1_band, y0_band + 1, H))
+
+            band_h = y1_band - y0_band
+
+            img_send = gray[y0_band:y0_band + band_h, 0:W]
+            self._aruco_last_roi = (0, y0_band, W, band_h)
+
+            # K shift only by y0
+            if K0 is not None:
+                K_send = K0.copy()
+                K_send[1, 2] -= float(y0_band)
+            else:
+                K_send = None
+            D_send = D0
+
+        elif mode == "track" and self._aruco_last_xy is not None:
+            # tracking ROI around last_xy (в FULL координатах)
+            cx, cy = self._aruco_last_xy
+
+            crop_w = int(getattr(st, "aruco_track_w", 1920) or 1920)
+            crop_h = int(getattr(st, "aruco_track_h", 1080) or 1080)
+            crop_w = min(crop_w, W)
+            crop_h = min(crop_h, H)
+
+            x0 = int(_clamp(cx - crop_w * 0.5, 0, W - crop_w))
+            y0 = int(_clamp(cy - crop_h * 0.5, 0, H - crop_h))
+
+            img_send = gray[y0:y0 + crop_h, x0:x0 + crop_w]
+            self._aruco_last_roi = (x0, y0, crop_w, crop_h)
+
+            # shift K principal point into ROI coords
+            if K0 is not None:
+                K_send = K0.copy()
+                K_send[0, 2] -= float(x0)
+                K_send[1, 2] -= float(y0)
+            else:
+                K_send = None
+            D_send = D0
+        # ============================
+        # SCAN MODE: left + right crop
+        # ============================
+        elif mode == "scan":
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            H, W = gray.shape[:2]
+
+            # --- vertical band ---
+            top_frac = float(getattr(st, "aruco_scan_top_frac", 0.20) or 0.20)
+            bot_frac = float(getattr(st, "aruco_scan_bot_frac", 0.30) or 0.30)
+            top_frac = float(_clamp(top_frac, 0.0, 0.45))
+            bot_frac = float(_clamp(bot_frac, 0.0, 0.45))
+
+            y0 = int(H * top_frac)
+            y1 = int(H * (1.0 - bot_frac))
+            y0 = int(_clamp(y0, 0, H - 2))
+            y1 = int(_clamp(y1, y0 + 1, H))
+            band_h = y1 - y0
+
+            # --- horizontal split (4K -> 2x 1920) ---
+            half_w = W // 2
+
+            rois = [
+                (0,      y0, half_w, band_h),     # LEFT
+                (half_w, y0, half_w, band_h),     # RIGHT
+            ]
+
+            # round-robin: send LEFT then RIGHT then LEFT...
+            phase = int(getattr(self, "_aruco_scan_phase", 0) or 0) % len(rois)
+            x0, y0r, w, h = rois[phase]
+
+            img_send = gray[y0r:y0r + h, x0:x0 + w]
+            if img_send.size == 0:
+                return self._aruco_last
+
+            ok, buf = cv2.imencode(".jpg", img_send, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not ok:
+                return self._aruco_last
+
+            # intrinsics: shift principal point into ROI coords
+            K0 = getattr(st, "cam_K", None)
+            D0 = getattr(st, "cam_D", None)
+            if K0 is not None:
+                K_send = K0.copy()
+                K_send[0, 2] -= float(x0)
+                K_send[1, 2] -= float(y0r)
+            else:
+                K_send = None
+
+            try:
+                self._aruco_conn.send((
+                    buf.tobytes(),
+                    wanted_ids,
+                    marker_len_m,
+                    K_send,
+                    D0,
+                ))
+                self._aruco_last_roi = (x0, y0r, w, h)
+                self._aruco_last_send_wall = now
+            except Exception:
+                pass
+
+            # переключаем половину на следующий тик
+            self._aruco_scan_phase = (phase + 1) % len(rois)
+
+            return self._aruco_last
+        ok, buf = cv2.imencode(".jpg", img_send, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            return self._aruco_last
 
         try:
-            self._aruco_conn.send((buf.tobytes(), wanted_ids, marker_len_m, K, D, downscale))
-            self._aruco_send_ts = now
-            self._aruco_waiting = True
-        except Exception as e:
-            print("[ARUCO] send error:", e, flush=True)
-            self._aruco_last = None
-            self._aruco_last_ts = 0.0
-            self._aruco_waiting = False
-            return None
+            self._aruco_conn.send((
+                buf.tobytes(),
+                wanted_ids,
+                marker_len_m,
+                K_send,
+                D_send,
+            ))
+            self._aruco_last_send_wall = now
+        except Exception:
+            pass
 
         return self._aruco_last
-
     # ============================================================
     # Marker control 
     # ============================================================
@@ -575,32 +798,47 @@ class VideoController(QtCore.QObject):
         x = float(ax + t * (bx - ax))
         y = float(ay + t * (by - ay))
         return (x, y, i, bx, by)
+    def reset_pole_snap_anchor(self, reason: str = "start"):
+        st = self.state
+        st._pole_anchor_route_m = None
+        st._pole_anchor_robot_px = None
+        st._pole_track_active = False
+        st._pole_track_id = None
+        st._pole_track_start_ts = 0.0
+        st._pole_track_lost_ts = None
+        st._pole_last_cx = None
+        st._pole_track_cx_anchor = None  # <-- FIX
+        print(f"[POLE][SNAP] RESET anchor (reason={reason})", flush=True)
     def _marker_snap_on_pole_pass(self):
         """
-        Снэп по "проезду столба" (straight pole left frame).
+        POLE SNAP (правильная семантика):
 
-        Единственное ограничение (как ты попросил):
-        - если с момента последней заякоренной позиции проезда столба ровер проехал < 15 м,
-        то НЕ снепаем, но ЛОГИРУЕМ.
+        - Первый проезд столба:
+            anchor_route_m := cur_route_m
+            (опционально) anchor_robot_px := robot_px
+            LOG: anchor init
 
-        Иначе:
-        - target = anchor + pole_spacing_m
-        - route_m := target (без clamp'ов и прочего)
-        - anchor := target
-        - логируем, на сколько поправили (delta).
+        - Каждый следующий проезд столба:
+            expected := anchor_route_m + pole_spacing_m
+            route_m := expected
+            anchor_route_m := expected
+            LOG: cur -> expected (delta)
+
+        Ограничение (как ты просил ранее) оставляем:
+        - если проехали от anchor меньше pole_snap_min_travel_m -> НЕ снепаем, но логируем.
         """
         st = self.state
         now = time.monotonic()
 
-        pole_spacing_m = float(getattr(st, "pole_spacing_m", 6.7) or 6.7)
+        pole_spacing_m = float(getattr(st, "pole_spacing_m", 25) or 25)
         pole_spacing_m = float(_clamp(pole_spacing_m, 0.5, 50.0))
 
         min_travel_for_snap_m = float(getattr(st, "pole_snap_min_travel_m", 15.0) or 15.0)
         min_travel_for_snap_m = float(_clamp(min_travel_for_snap_m, 0.0, 200.0))
 
         def _get_route_m():
-            # Подстрой под твой проект (я оставляю "мягкий" поиск по возможным полям)
-            for key in ("route_progress_m", "route_s_m", "robot_route_m", "route_done_m"):
+            # ВАЖНО: читаем всегда ОДИН и тот же ключ приоритетно
+            for key in ("route_done_m", "route_progress_m", "route_s_m", "robot_route_m"):
                 if hasattr(st, key):
                     v = getattr(st, key, None)
                     if v is None:
@@ -612,55 +850,84 @@ class VideoController(QtCore.QObject):
             return None
 
         def _set_route_m(v: float) -> bool:
-            # Подстрой под твой проект: куда именно писать прогресс
-            for key in ("route_progress_m", "route_s_m", "robot_route_m", "route_done_m"):
-                if hasattr(st, key):
-                    setattr(st, key, float(v))
-                    return True
-            return False
+            # ВАЖНО: пишем тоже приоритетно в один ключ (лучше route_done_m)
+            wrote = False
+            if hasattr(st, "route_done_m"):
+                st.route_done_m = float(v)
+                wrote = True
+            elif hasattr(st, "route_progress_m"):
+                st.route_progress_m = float(v)
+                wrote = True
+            elif hasattr(st, "route_s_m"):
+                st.route_s_m = float(v)
+                wrote = True
+            elif hasattr(st, "robot_route_m"):
+                st.robot_route_m = float(v)
+                wrote = True
+
+            # если есть возможность — синхронизируем robot_px/heading по done_m
+            try:
+                if wrote and hasattr(self, "_set_robot_pose_by_done_m"):
+                    self._set_robot_pose_by_done_m(float(v))
+            except Exception:
+                pass
+            return wrote
 
         cur = _get_route_m()
         if cur is None:
-            print("[POLE][SNAP] skip: no cur_route_m in state", flush=True)
+            print("[POLE][SNAP] skip: no route_m in state", flush=True)
             return
 
-        # anchor = позиция "последнего проезда столба" в метрах по маршруту
+        # anchor = позиция последнего проезда столба в метрах по маршруту
         if not hasattr(st, "_pole_anchor_route_m"):
             st._pole_anchor_route_m = None
+        if not hasattr(st, "_pole_anchor_robot_px"):
+            st._pole_anchor_robot_px = None
 
         if st._pole_anchor_route_m is None:
-            # первый столб: якорим и выходим (снэпать некуда)
             st._pole_anchor_route_m = float(cur)
-            print(f"[POLE][SNAP] anchor init: cur={cur:.2f}m", flush=True)
+            st._pole_anchor_robot_px = getattr(st, "robot_px", None)
+            print(
+                f"[POLE][SNAP] anchor init: anchor_route_m={st._pole_anchor_route_m:.2f}m "
+                f"robot_px={st._pole_anchor_robot_px}",
+                flush=True,
+            )
             st._marker_last_pole_pass_ts = float(now)
             return
 
         anchor = float(st._pole_anchor_route_m)
         traveled = float(cur - anchor)
 
-        # === единственное ограничение: traveled < 15m => no snap, but log ===
+        # ограничение на минимум проезда между "столбами"
         if traveled < min_travel_for_snap_m:
             print(
                 f"[POLE][SNAP] NO-SNAP (travel<{min_travel_for_snap_m:.1f}m): "
-                f"cur={cur:.2f}m anchor={anchor:.2f}m traveled={traveled:.2f}m",
+                f"cur={cur:.2f}m anchor={anchor:.2f}m traveled={traveled:.2f}m -> REANCHOR",
                 flush=True,
             )
+
+            # ✅ ВАЖНО: считаем это "последним проездом столба", но без SNAP
+            # чтобы следующий столб не считался от старого anchor (иначе будет скачок "на 2 столба назад")
+            st._pole_anchor_route_m = float(cur)
+            st._pole_anchor_robot_px = getattr(st, "robot_px", None)
+
             st._marker_last_pole_pass_ts = float(now)
             return
 
-        target = float(anchor + pole_spacing_m)
-        delta = float(target - cur)
+        expected = float(anchor + pole_spacing_m)
+        delta = float(expected - cur)
 
-        ok = _set_route_m(target)
+        ok = _set_route_m(expected)
 
         print(
-            f"[POLE][SNAP] SNAP: cur={cur:.2f}m -> target={target:.2f}m "
-            f"(delta={delta:+.2f}m), anchor={anchor:.2f}m, traveled={traveled:.2f}m, ok={ok}",
+            f"[POLE][SNAP] SNAP: cur={cur:.2f}m -> expected={expected:.2f}m "
+            f"(delta={delta:+.2f}m) spacing={pole_spacing_m:.2f}m ok={ok}",
             flush=True,
         )
 
-        # якорь теперь "последний проезд столба" = target
-        st._pole_anchor_route_m = float(target)
+        # Сдвигаем якорь строго на spacing
+        st._pole_anchor_route_m = float(expected)
+        st._pole_anchor_robot_px = getattr(st, "robot_px", None)
         st._marker_last_pole_pass_ts = float(now)
     def _set_robot_pose_by_done_m(self, done_m: float) -> bool:
         """
@@ -754,6 +1021,12 @@ class VideoController(QtCore.QObject):
         # -----------------------------
         # init state (one-time)
         # -----------------------------
+        if not hasattr(st, "_pole_track_lost_ts"):
+            st._pole_track_lost_ts = None
+        if not hasattr(st, "_pole_track_last_seen_ts"):
+            st._pole_track_last_seen_ts = 0.0
+        if not hasattr(st, "_pole_track_acquired"):
+            st._pole_track_acquired = False
         if not hasattr(st, "marker_turn_active"):
             st.marker_turn_active = False
         if not hasattr(st, "marker_turn_dir"):
@@ -788,13 +1061,13 @@ class VideoController(QtCore.QObject):
             st._pole_track_active = False
         if not hasattr(st, "_pole_track_id"):
             st._pole_track_id = None
-        if not hasattr(st, "_pole_track_miss_cnt"):
-            st._pole_track_miss_cnt = 0
         if not hasattr(st, "_pole_track_start_ts"):
             st._pole_track_start_ts = 0.0
-        # last seen zone anchor
+        # last seen zone anchor (legacy) + frozen tracker anchor (fix)
         if not hasattr(st, "_pole_last_cx"):
             st._pole_last_cx = None
+        if not hasattr(st, "_pole_track_cx_anchor"):
+            st._pole_track_cx_anchor = None  # <-- FIX: frozen cx of current physical pole
 
         # -----------------------------
         # current marker (from state; already filled by _apply_marker_to_state)
@@ -820,9 +1093,44 @@ class VideoController(QtCore.QObject):
             return (True, v)
 
         def _apply_steer_raw(steer01: float):
+            # clamp raw
             steer01 = float(np.clip(steer01, -1.0, +1.0))
+
+            # --- dt for smoothing ---
+            last_ts = float(getattr(st, "_marker_steer_last_ts", 0.0) or 0.0)
+            dt = 0.0 if last_ts <= 0.0 else float(now - last_ts)
+            if dt <= 1e-4 or dt > 0.5:
+                dt = 1.0 / 30.0  # fallback ~30Hz
+            st._marker_steer_last_ts = float(now)
+
+            # --- 1) low-pass filter (EMA) ---
+            # marker_steer_tau_s: 0.15..0.45 обычно норм, дальняк -> больше
+            tau = float(getattr(st, "marker_steer_tau_s", 0.28) or 0.28)
+            tau = float(_clamp(tau, 0.05, 1.00))
+            alpha = float(dt / (tau + dt))
+
+            prev = float(getattr(st, "_marker_steer_f", 0.0) or 0.0)
+            filt = prev + alpha * (steer01 - prev)
+
+            # --- 2) step limit (slew) on filtered steer ---
+            # marker_steer_step: максимум изменения steer за тик (0.03..0.12)
+            step = float(getattr(st, "marker_steer_step", 0.06) or 0.06)
+            step = float(_clamp(step, 0.01, 0.25))
+            df = float(filt - prev)
+            if df > step:
+                filt = prev + step
+            elif df < -step:
+                filt = prev - step
+
+            # store
+            st._marker_steer_f = float(filt)
+
+            # to PWM
+            steer01 = float(np.clip(filt, -1.0, +1.0))
             delta = int(np.clip(steer01 * max_delta, -max_delta, max_delta))
             motors_set(st, base + delta, base - delta, None)
+
+            # HUD/debug
             st.marker_last_steer = steer01
 
         def _go_straight():
@@ -839,16 +1147,18 @@ class VideoController(QtCore.QObject):
 
         def _in_last_zone(cx_now: float) -> bool:
             """
-            Ограничение поиска "того же столба" только в зоне последнего положения.
-            По умолчанию gate_frac = 0.15 (±15% ширины кадра).
+            FIX: "тот же столб" ищем только вокруг FROZEN якоря текущего трекинга.
+            Пока _pole_track_active=True, cx_anchor НЕ переносится на новый столб.
             """
             gate_frac = float(getattr(st, "pole_same_gate_frac", 0.15) or 0.15)
             gate_frac = float(_clamp(gate_frac, 0.05, 0.40))
             gate_px = gate_frac * float(W)
 
-            cx0 = getattr(st, "_pole_last_cx", None)
+            # если трекинг активен — используем frozen anchor
+            cx0 = getattr(st, "_pole_track_cx_anchor", None) if bool(getattr(st, "_pole_track_active", False)) else getattr(st, "_pole_last_cx", None)
+
             if cx0 is None:
-                return True  # если якоря ещё нет — не ограничиваем
+                return True
             try:
                 return abs(float(cx_now) - float(cx0)) <= gate_px
             except Exception:
@@ -873,6 +1183,11 @@ class VideoController(QtCore.QObject):
                 st._turn_lock_dir = None
                 st._turn_trig_cnt = 0
                 st.turn_execute = False
+
+                # ВАЖНО: после РЕАЛЬНОГО завершения поворота разрешаем отпустить граф
+                if bool(getattr(st, "graph_freeze_enabled", False)):
+                    st.graph_freeze_release = True
+
                 _go_straight()
                 return True
 
@@ -888,31 +1203,92 @@ class VideoController(QtCore.QObject):
             return True
 
         # =========================================================
-        # 2) POLE TRACK: если активен и маркера нет -> считаем miss (N=10) и SNAP один раз
+        # 2) POLE TRACK: stable acquire + time-based loss (same ID + same zone)
         # =========================================================
-        # ВАЖНО: N фиксируем в 10 кадров, как ты просил
-        miss_need = 10
+        loss_s = float(getattr(st, "pole_loss_s", 3.0) or 3.0)
+        loss_s = float(_clamp(loss_s, 0.2, 10.0))
+
+        # сколько кадров подряд нужно увидеть столб, чтобы считать "захватили"
+        acq_need = int(getattr(st, "pole_acquire_need_frames", 3) or 3)
+        acq_need = int(_clamp(acq_need, 1, 10))
+
+        # небольшая защита от морганий детектора
+        grace_s = float(getattr(st, "pole_loss_grace_s", 0.25) or 0.25)
+        grace_s = float(_clamp(grace_s, 0.0, 2.0))
+
+        # init доп. полей (один раз)
+        if not hasattr(st, "_pole_track_seen_cnt"):
+            st._pole_track_seen_cnt = 0
+        if not hasattr(st, "_pole_track_last_seen_ts"):
+            st._pole_track_last_seen_ts = 0.0
+        if not hasattr(st, "_pole_track_acquired"):
+            st._pole_track_acquired = False
 
         if bool(getattr(st, "_pole_track_active", False)):
-            # если видим что-то, но это НЕ straight-метка в зоне — для трекера считаем как "не видим"
-            tracker_seen = bool(seen and _is_straight_id(mid) and _in_last_zone(cx))
+            tid = getattr(st, "_pole_track_id", None)
+
+            # ВАЖНО: "тот же столб" = тот же ID + в своей зоне
+            tracker_seen = bool(
+                (tid is not None)
+                and seen
+                and (int(mid) == int(tid))
+                and _in_last_zone(cx)
+            )
+
             if tracker_seen:
-                st._pole_track_miss_cnt = 0
-                st._pole_last_cx = float(cx)  # обновляем зону "где был последний раз"
+                # копим подряд виденные кадры
+                st._pole_track_seen_cnt = int(getattr(st, "_pole_track_seen_cnt", 0) or 0) + 1
+                st._pole_track_last_seen_ts = float(now)
+
+                # ВАЖНО: пока НЕ acquired — можем подправлять anchor (чтобы захват был стабильный)
+                if not bool(getattr(st, "_pole_track_acquired", False)):
+                    st._pole_track_cx_anchor = float(cx)
+                    st._pole_last_cx = float(cx)  # legacy для дебага/визуала
+
+                # как только "захватили" — ЗАМОРАЖИВАЕМ anchor (дальше не переносим никуда)
+                if (not bool(getattr(st, "_pole_track_acquired", False))) and (st._pole_track_seen_cnt >= acq_need):
+                    st._pole_track_acquired = True
+                    st._pole_track_lost_ts = None
+                    # anchor уже выставлен выше; дальше НЕ обновляем
+                    print(f"[POLE] ACQUIRED id={tid} cx_anchor={float(st._pole_track_cx_anchor):.1f}", flush=True)
+
+                # пока видим — потери нет
+                st._pole_track_lost_ts = None
+
             else:
-                st._pole_track_miss_cnt = int(getattr(st, "_pole_track_miss_cnt", 0) or 0) + 1
-                if st._pole_track_miss_cnt >= miss_need:
-                    # PASS -> SNAP (один раз)
-                    st._pole_track_active = False
-                    st._pole_track_id = None
-                    st._pole_track_miss_cnt = 0
-                    st._pole_track_start_ts = 0.0
-                    st._pole_last_cx = None
+                # если ещё не "acquired" — НЕ начинаем потерю вообще (это убирает моментальный LOST start)
+                if not bool(getattr(st, "_pole_track_acquired", False)):
+                    # сброс подряд виденных кадров, но трек активен (ждём нормального захвата)
+                    st._pole_track_seen_cnt = 0
 
-                    st._marker_last_pole_pass_ts = float(now)
-                    print("[POLE] track stop (miss>=10) -> SNAP", flush=True)
-                    self._marker_snap_on_pole_pass()
+                else:
+                    # acquired -> можно начинать потерю, но с grace
+                    last_seen = float(getattr(st, "_pole_track_last_seen_ts", 0.0) or 0.0)
+                    if last_seen > 0.0 and (now - last_seen) < grace_s:
+                        pass
+                    else:
+                        # стартуем потерю ОДИН раз
+                        if getattr(st, "_pole_track_lost_ts", None) is None:
+                            st._pole_track_lost_ts = float(now)
 
+                        lost_dt = float(now - float(st._pole_track_lost_ts))
+                        if lost_dt >= loss_s:
+                            print(f"[POLE] lost {lost_dt:.2f}s >= {loss_s:.2f}s -> SNAP", flush=True)
+                            # LOSS CONFIRMED -> SNAP ONCE
+                            print(f"[POLE] lost {lost_dt:.2f}s >= {loss_s:.2f}s -> SNAP", flush=True)
+
+                            st._pole_track_active = False
+                            st._pole_track_id = None
+                            st._pole_track_start_ts = 0.0
+                            st._pole_last_cx = None
+                            st._pole_track_cx_anchor = None  
+                            st._pole_track_lost_ts = None
+                            st._pole_track_seen_cnt = 0
+                            st._pole_track_last_seen_ts = 0.0
+                            st._pole_track_acquired = False
+
+                            st._marker_last_pole_pass_ts = float(now)
+                            self._marker_snap_on_pole_pass()
         # =========================================================
         # 3) If marker not seen: ALWAYS straight (no timeouts, no fallback)
         #    (pole snap handled выше, отдельно)
@@ -928,14 +1304,22 @@ class VideoController(QtCore.QObject):
             # при поворотных метках — обнуляем "запоминание" столбов, как ты просил
             st._pole_track_active = False
             st._pole_track_id = None
-            st._pole_track_miss_cnt = 0
             st._pole_track_start_ts = 0.0
+            st._pole_track_lost_ts = None
             st._pole_last_cx = None
-
             if st._turn_lock_id is None:
                 st._turn_lock_id = int(mid)
                 st._turn_lock_dir = ("left" if int(mid) == turn_left_id else "right")
                 st._turn_trig_cnt = 0
+
+            # --- NEW: if freeze active -> enforce graph direction ---
+            if self._freeze_is_active() and self._freeze_is_allowed_now():
+                gdir = self._graph_turn_dir_now()          # left/right (real turn)
+                adir = self._aruco_turn_dir_from_id(mid)   # left/right from 20/30
+                if gdir in ("left", "right") and adir in ("left", "right") and (gdir != adir):
+                    # метка "не про этот поворот" -> игнорим 20/30
+                    _go_straight()
+                    return True
 
             if st._turn_lock_id is not None and int(mid) != int(st._turn_lock_id):
                 _go_straight()
@@ -959,7 +1343,8 @@ class VideoController(QtCore.QObject):
                 st._marker_snap_after_turn = True
                 st._marker_snap_inited = False
                 st._marker_snap_anchor_done_m = None
-
+                if bool(getattr(st, "graph_freeze_enabled", False)):
+                    st.graph_freeze_engaged = True
                 tdir = str(st.marker_turn_dir or "")
                 sign = -1.0 if tdir == "left" else (+1.0 if tdir == "right" else 0.0)
                 turn_steer = float(getattr(st, "marker_turn_steer", 1.0) or 1.0)
@@ -1016,9 +1401,9 @@ class VideoController(QtCore.QObject):
             target_side = float(getattr(st, "marker_target_side_m", 2.0) or 2.0)
             target_side = float(_clamp(target_side, 0.2, 10.0))
 
-            dead_m    = float(getattr(st, "marker_deadband_m", 0.10) or 0.10)
-            kp        = float(getattr(st, "marker_kp", 0.35) or 0.35)
-            max_steer = float(getattr(st, "marker_max_steer", 0.8) or 0.8)
+            dead_m    = float(getattr(st, "marker_deadband_m", 0.15) or 0.15)
+            kp        = float(getattr(st, "marker_kp", 0.2) or 0.2)
+            max_steer = float(getattr(st, "marker_max_steer", 0.35) or 0.35)
 
             x_des = (+target_side) if side == "right" else (-target_side)
             err = float(x - x_des)
@@ -1031,19 +1416,27 @@ class VideoController(QtCore.QObject):
             st.turn_execute = False
 
             # --- pole tracking start: только если трекинг не активен ---
-            # И главное: трек "того же столба" ведём по зоне последнего cx
             if not bool(getattr(st, "_pole_track_active", False)):
                 st._pole_track_active = True
                 st._pole_track_id = int(mid)
-                st._pole_track_miss_cnt = 0
                 st._pole_track_start_ts = float(now)
-                st._pole_last_cx = float(cx)
-                print(f"[POLE] track start id={mid} cx={st._pole_last_cx:.1f}", flush=True)
+
+                # FIX: frozen anchor for this physical pole
+                st._pole_track_cx_anchor = float(cx)
+                st._pole_last_cx = float(cx)  # legacy/debug
+
+                # ЖЁСТКО обнуляем всю внутреннюю механику трекера
+                st._pole_track_lost_ts = None
+                st._pole_track_seen_cnt = 0
+                st._pole_track_last_seen_ts = 0.0
+                st._pole_track_acquired = False
+
+                print(f"[POLE] track start id={mid} cx_anchor={float(st._pole_track_cx_anchor):.1f}", flush=True)
             else:
-                # если трек уже активен — принимаем обновление ТОЛЬКО в зоне последнего cx
-                if _in_last_zone(cx):
-                    st._pole_track_miss_cnt = 0
-                    st._pole_last_cx = float(cx)
+                # FIX: ничего не переносим на "новый" столб.
+                # При active tracking мы НЕ обновляем cx_anchor здесь вообще.
+                # Любое обновление разрешено только в tracker_seen И ТОЛЬКО до acquired.
+                pass
 
             return True
 
@@ -1088,37 +1481,41 @@ class VideoController(QtCore.QObject):
 
         st = self.state
 
-        fps = float(getattr(self, "_fps_val", 0.0) or 0.0)
+        # ===== FPS =====
+        if bool(getattr(st, "camera_available", False)):
+            fps = float(getattr(self, "_fps_val", 0.0) or 0.0)
+            fps_txt = f"{fps:4.1f}"
+        else:
+            fps_txt = "none"
 
-        # скорость: если где-то рассчитывается — берём её
+        # ===== SPEED =====
         v = getattr(st, "speed_mps", None)
         try:
             v = float(v) if v is not None else None
         except Exception:
             v = None
-
-        # fallback: если speed_mps нет, покажем 0.0 (или можно сделать “—”)
         v_txt = "—" if v is None else f"{v:.2f}"
 
-        # steer: для road берём _rf_steer, для markers — marker_last_steer
+        # ===== STEER =====
         nav = str(getattr(st, "nav_mode", "") or "")
-        steer = 0.0
         if nav == "road":
             steer = float(getattr(st, "_rf_steer", 0.0) or 0.0)
         else:
             steer = float(getattr(st, "marker_last_steer", 0.0) or 0.0)
 
-        # (опционально) PWM L/R — если хочешь видеть
+        # ===== PWM =====
         l_pwm = getattr(st, "l_pwm", None)
         r_pwm = getattr(st, "r_pwm", None)
 
-        # Row1: FPS + V (и можно PWM)
         if l_pwm is not None and r_pwm is not None:
-            self._lblTelemRow1.setText(f"FPS {fps:4.1f}   V {v_txt} m/s   PWM {int(l_pwm)}/{int(r_pwm)}")
+            self._lblTelemRow1.setText(
+                f"FPS {fps_txt}   V {v_txt} m/s   PWM {int(l_pwm)}/{int(r_pwm)}"
+            )
         else:
-            self._lblTelemRow1.setText(f"FPS {fps:4.1f}   V {v_txt} m/s")
+            self._lblTelemRow1.setText(
+                f"FPS {fps_txt}   V {v_txt} m/s"
+            )
 
-        # Row2: steer
         self._lblTelemRow2.setText(f"STEER {steer:+.2f}")
     def _update_turn_lr_ui(self):
         st = self.state
@@ -1150,7 +1547,37 @@ class VideoController(QtCore.QObject):
     # ============================================================
     # Tick
     # ============================================================
+    def _aruco_turn_dir_from_id(self, mid_int: int) -> Optional[str]:
+        st = self.state
+        turn_right_id = int(getattr(st, "aruco_id_turn_right", 20) or 20)
+        turn_left_id  = int(getattr(st, "aruco_id_turn_left", 30) or 30)
 
+        mid_int = int(mid_int)
+        if mid_int == turn_left_id:
+            return "left"
+        if mid_int == turn_right_id:
+            return "right"
+        return None
+
+    def _graph_turn_dir_now(self) -> Optional[str]:
+        st = self.state
+        v = getattr(st, "next_turn_dir", None)
+        v = str(v) if v is not None else None
+        return v if v in ("left", "right", "straight") else None
+
+    def _freeze_is_active(self) -> bool:
+        st = self.state
+        return bool(getattr(st, "graph_freeze_enabled", False))
+
+    def _freeze_is_allowed_now(self) -> bool:
+        """
+        Marker-mode: никакого roadbin/cam_junc_seen.
+        Freeze релевантен, если routing выбрал активный junction и это реальный поворот.
+        """
+        st = self.state
+        if getattr(st, "_active_turn_j_id", None) is None:
+            return False
+        return self._graph_turn_dir_now() in ("left", "right")
     def _camera_tick(self):
         # keep camera profile consistent with nav mode
         if not self._ensure_camera_for_current_mode():
@@ -1203,19 +1630,34 @@ class VideoController(QtCore.QObject):
         # MODE_MARKERS: ArUco + optional marker drive
         # ============================================================
         if nav_mode == MODE_MARKERS:
+            # ВАЖНО: в marker-mode всегда обновляем подсказку поворота по графу
+            # (она же подготавливает _junc_proj и может включать freeze-режим)
+            try:
+                update_junction_turn_hint(st)
+            except Exception as e:
+                print("[MARKERS] update_junction_turn_hint error:", e, flush=True)
+
             m = None
             if bool(getattr(st, "marker_mode", True)):
                 m = self._detect_aruco(frame)
             self._apply_marker_to_state(m, frame)
 
-            # control only if running AND not manual
             did_marker = False
-            if bool(getattr(st, "is_running", False)) and (not bool(getattr(st, "manual_drive", False))):
-                # also avoid if trajectory_mode flag exists
-                if not bool(getattr(st, "trajectory_mode", False)):
-                    did_marker = self._marker_drive(frame)
 
-            # in marker mode we do not run seg
+            is_run = bool(getattr(st, "is_running", False))
+            is_manual = bool(getattr(st, "manual_drive", False))
+            is_traj = bool(getattr(st, "trajectory_mode", False))
+
+            # 1 Hz debug: почему marker_drive не зовём / что видим
+            if not hasattr(st, "_dbg_markers_last_ts"):
+                st._dbg_markers_last_ts = 0.0
+            now = time.monotonic()
+            if (now - float(st._dbg_markers_last_ts or 0.0)) >= 1.0:
+                st._dbg_markers_last_ts = now
+
+            if is_run and (not is_manual) and (not is_traj):
+                did_marker = self._marker_drive(frame)
+
             return self._render_camera(frame, mask=None, road_bin=None, road_support=0.0, thr=0.0)
 
         # ============================================================
@@ -1401,7 +1843,8 @@ class VideoController(QtCore.QObject):
         chosen = None
 
         # 1) If pole tracking active: prefer straight markers in last zone
-        if bool(getattr(st, "_pole_track_active", False)):
+        #    BUT only while we are NOT in "losing" phase (loss is sticky and should not be canceled by new markers)
+        if bool(getattr(st, "_pole_track_active", False)) and (getattr(st, "_pole_track_lost_ts", None) is None):
             best_d = 1e9
             for mi in cand:
                 mid = _get_id(mi)
@@ -1473,25 +1916,32 @@ class VideoController(QtCore.QObject):
 
             st.marker_dist_m = chosen.get("dist_m", None)
             st.marker_cx = float(chosen.get("cx", 0.5 * W) or (0.5 * W))
+            st.marker_cy = float(chosen.get("cy", 0.5 * H) or (0.5 * H))
             st.marker_side = chosen.get("side", None)
             st.marker_ts = now
             st.marker_tvec = chosen.get("tvec", None)
             st.marker_corners = chosen.get("corners", None)
+            return
 
-            # для pole tracking: обновляем "последнюю зону", если выбран straight
-            if mid in (straight_left_id, straight_right_id):
-                st._pole_last_cx = float(st.marker_cx)
+        # --- NO chosen: anti-blink hold ---
+        keep_s = float(getattr(st, "marker_keep_s", 0.25) or 0.25)
+        last_ts = float(getattr(st, "marker_ts", 0.0) or 0.0)
 
-        else:
-            st.marker_seen = False
-            st.marker_id = -1
-            st.marker_dist_m = None
-            st.marker_tvec = None
-            st.marker_corners = None
-            st.marker_follow_side = None
-            st.marker_side = None
-            # marker_ts можно оставить (как "последний виденный"), но если хочешь — чисти:
-            # st.marker_ts = 0.0
+        if last_ts > 0.0 and (now - last_ts) <= keep_s:
+            # HOLD LAST (anti-blink): НЕ трогаем dist/tvec/corners/cx/cy
+            st.marker_seen = True
+            return
+
+        # реально потеряли
+        st.marker_cy = None
+        st.marker_seen = False
+        st.marker_id = -1
+        st.marker_dist_m = None
+        st.marker_tvec = None
+        st.marker_corners = None
+        st.marker_follow_side = None
+        st.marker_side = None
+        return
     # ============================================================
     # road_bin build & support
     # ============================================================
@@ -1627,7 +2077,6 @@ class VideoController(QtCore.QObject):
     def _render_camera(self, frame_bgr, mask=None, road_bin=None, road_support: float = 0.0, thr: float = 0.0):
         if getattr(self.state, "video_mode", "radar") != "camera":
             return
-        self._update_telem_labels()
 
         sc = self._radar_scene_provider() if self._radar_scene_provider else None
         if sc is None:
@@ -1674,7 +2123,7 @@ class VideoController(QtCore.QObject):
         # marker overlay (TTL)
         try:
             st = self.state
-            draw_ttl = float(getattr(st, "marker_draw_ttl_s", 0.25) or 0.25)
+            draw_ttl = float(getattr(st, "marker_draw_ttl_s", 0.5) or 0.5)
             ts = float(getattr(st, "marker_ts", 0.0) or 0.0)
             fresh = (ts > 0.0) and ((time.monotonic() - ts) <= draw_ttl)
 

@@ -37,14 +37,32 @@ class TrajectoryController(QtCore.QObject):
 
     def _set_traj_mode(self, enabled: bool) -> None:
         st = self.state
+
         if enabled:
+            # запомним прежний режим, чтобы при OFF вернуть обратно
+            if not hasattr(st, "_traj_prev_nav_mode"):
+                st._traj_prev_nav_mode = getattr(st, "nav_mode", MODE_MARKERS)
+
             st.nav_mode = MODE_TRAJ
-            # для обратной совместимости (если где-то ещё проверяют)
-            st.trajectory_mode = True
+            st.trajectory_mode = True  # legacy флаг, но держим консистентно
+            return
+
+        # OFF
+        st.trajectory_mode = False
+
+        # вернем режим туда, где были до траектории
+        prev = getattr(st, "_traj_prev_nav_mode", None)
+        if prev:
+            st.nav_mode = prev
         else:
-            # при выключении траектории НЕ навязываю какой режим дальше
-            # обычно логично вернуться в MODE_ROAD или MODE_MARKERS — но это решает UI/page_drive
-            st.trajectory_mode = False
+            # fallback
+            if getattr(st, "nav_mode", MODE_MARKERS) == MODE_TRAJ:
+                st.nav_mode = MODE_MARKERS
+
+        try:
+            delattr(st, "_traj_prev_nav_mode")
+        except Exception:
+            pass
 
     # ---- API expected by page_drive.py ----
     def set_enabled(self, enabled: bool):
@@ -94,7 +112,10 @@ class TrajectoryController(QtCore.QObject):
         # ---- OFF ----
         # выключаем режим траектории (nav_mode пусть переключает UI)
         self._set_traj_mode(False)
+        st.is_running = False
 
+        if self._traj_timer.isActive():
+            self._traj_timer.stop()
         if self._traj_timer.isActive():
             self._traj_timer.stop()
 
@@ -102,12 +123,6 @@ class TrajectoryController(QtCore.QObject):
             motors_set(st, 1500, 1500, getattr(st, "b_pwm", 1500) or 1500)
         except Exception:
             pass
-
-        try:
-            stop_route_animation(st, keep_progress=True)
-        except Exception:
-            pass
-
         if callable(self._on_stop_cb):
             try:
                 self._on_stop_cb()

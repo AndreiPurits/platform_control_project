@@ -273,16 +273,20 @@ class TrajectoryMapEditor(QtWidgets.QMainWindow):
             )
             return
 
+        base_dir = os.getcwd()
+        maps_dir = os.path.join(base_dir, "maps_repo")
+        os.makedirs(maps_dir, exist_ok=True)
         # Предлагаем имя файла для PNG
-        dlg = QtWidgets.QFileDialog(self, "Сохранить карту траектории", os.getcwd())
+        dlg = QtWidgets.QFileDialog(self, "Сохранить карту траектории", maps_dir)
         dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
         dlg.setNameFilter("PNG images (*.png)")
         dlg.setDefaultSuffix("png")
         if not dlg.exec_():
             return
 
-        png_path = dlg.selectedFiles()[0]
-        base, _ = os.path.splitext(png_path)
+        png_name = os.path.basename(png_path)
+        png_path = os.path.join(maps_dir, png_name)
+        base, _ = os.path.splitext(png_path)        
 
         # --- 1) Сохраняем PNG и получаем координаты в СИСТЕМЕ PNG ---
         pts_img = self._save_png(png_path, pts)

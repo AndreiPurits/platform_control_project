@@ -1,94 +1,98 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import sys
-import glob
-from pathlib import Path
-
 import cv2
 import numpy as np
+from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+from roadseg import RoadSeg
 
-# добавляем roadseg_work в sys.path
-if str(HERE) not in sys.path:
-    sys.path.append(str(HERE))
+# -----------------------------
+# Настройки
+# -----------------------------
+INPUT_DIR  = Path("images")
+MODEL_PATH = Path("roadseg_snow_best.onnx")
+OUTPUT_DIR = Path("output_eval2")
 
-try:
-    from roadseg import RoadSeg
-except Exception as e:
-    print("[SEG] cannot import RoadSeg:", e)
-    sys.exit(1)
+# что сохраняем
+SAVE_GRAY_MASK   = True   # mask_*.png (0..255)
+SAVE_HEATMAP     = True   # heat_*.png (colormap)
+SAVE_SIDE_BY_SIDE = True  # vis_*.png (orig | heatmap)
 
+# colormap для heatmap (OpenCV)
+# варианты: cv2.COLORMAP_TURBO, JET, INFERNO, VIRIDIS
+COLORMAP = cv2.COLORMAP_TURBO
+
+# -----------------------------
+def to_u8(prob_mask: np.ndarray) -> np.ndarray:
+    """float32 [0..1] -> uint8 [0..255]"""
+    m = np.nan_to_num(prob_mask, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
+    m = np.clip(m, 0.0, 1.0)
+    return (m * 255.0).astype(np.uint8)
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python eval_roadseg_masks.py <images_dir_rel_or_abs>")
-        print("Пример: python eval_roadseg_masks.py datasets/photos/Poly_asf")
-        sys.exit(1)
+    if not INPUT_DIR.exists():
+        raise FileNotFoundError(f"Папка с изображениями не найдена: {INPUT_DIR}")
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"ONNX-модель не найдена: {MODEL_PATH}")
 
-    # Папка с картинками (можно относительный путь от текущей директории)
-    in_dir = Path(sys.argv[1]).expanduser().resolve()
-    if not in_dir.is_dir():
-        print(f"[ERR] input dir not found: {in_dir}")
-        sys.exit(1)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "gray").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "heat").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "vis").mkdir(parents=True, exist_ok=True)
 
-    # Папка с масками: <имя_папки>_masks рядом
-    out_dir = in_dir.parent / f"{in_dir.name}_masks"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    seg = RoadSeg(onnx_path=str(MODEL_PATH))
+    if not seg.ok:
+        print("[ERROR] RoadSeg не инициализирован. Проверь путь к onnx и логи выше.")
+        return
 
-    onnx_path = HERE / "roadseg_asphalt.onnx"
-    print(f"[SEG] loading ONNX: {onnx_path}")
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+    image_paths = [p for p in INPUT_DIR.iterdir() if p.suffix.lower() in exts]
+    image_paths = sorted(image_paths)
 
-    seg = RoadSeg(
-        onnx_path=str(onnx_path),
-        input_size=(512, 512),
-    )
+    if not image_paths:
+        print(f"[WARNING] В {INPUT_DIR} нет изображений с расширениями {exts}")
+        return
 
-    if not getattr(seg, "ok", True):
-        print("[SEG] WARNING: RoadSeg reports ok=False, возможен stub-режим")
+    print(f"[INFO] Найдено изображений: {len(image_paths)}")
+    print(f"[INFO] Model input_size={seg.input_size} (W,H)")
 
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-    files = []
-    for pat in exts:
-        files.extend(sorted(glob.glob(str(in_dir / pat))))
-
-    if not files:
-        print(f"[WARN] no images found in {in_dir}")
-        sys.exit(0)
-
-    print(f"[INFO] found {len(files)} images in {in_dir}")
-    print(f"[INFO] masks will be saved to {out_dir}")
-
-    for path in files:
-        path = Path(path)
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    for img_path in image_paths:
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)  # BGR
         if img is None:
-            print(f"[WARN] cannot read {path.name}")
+            print(f"[ERROR] Не удалось прочитать {img_path}, пропускаем.")
             continue
 
-        try:
-            mask = seg.infer(img)
-        except Exception as e:
-            print(f"[ERR] seg.infer error on {path.name}: {e}")
+        # --- сырая вероятность [0..1], HxW float32
+        prob = seg.infer(img)
+        if prob is None or prob.size == 0:
+            print(f"[WARNING] infer() вернул пусто для {img_path}, пропускаем.")
             continue
 
-        if mask is None or mask.size == 0:
-            print(f"[WARN] empty mask for {path.name}")
-            continue
+        # --- grayscale 0..255
+        m_u8 = to_u8(prob)
 
-        # mask (H,W) с float 0..1 → uint8 0..255
-        mask_u8 = (np.clip(mask, 0.0, 1.0) * 255.0).astype("uint8")
+        # 1) Сохраняем grayscale mask
+        if SAVE_GRAY_MASK:
+            out_gray = OUTPUT_DIR / "gray" / f"{img_path.stem}_mask.png"
+            cv2.imwrite(str(out_gray), m_u8)
 
-        # сохраняем как PNG-грэйскейл
-        out_name = out_dir / f"{path.stem}_mask.png"
-        cv2.imwrite(str(out_name), mask_u8)
+        # 2) Сохраняем heatmap
+        if SAVE_HEATMAP or SAVE_SIDE_BY_SIDE:
+            heat = cv2.applyColorMap(m_u8, COLORMAP)  # BGR
 
-        print(f"[MASK] {path.name} -> {out_name.name}")
+            if SAVE_HEATMAP:
+                out_heat = OUTPUT_DIR / "heat" / f"{img_path.stem}_heat.png"
+                cv2.imwrite(str(out_heat), heat)
 
-    print("[DONE] all images processed")
+            # 3) Side-by-side: original | heat
+            if SAVE_SIDE_BY_SIDE:
+                # приводим heat к размеру оригинала (на всякий)
+                heat_rs = cv2.resize(heat, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                vis = np.hstack([img, heat_rs])
+                out_vis = OUTPUT_DIR / "vis" / f"{img_path.stem}_vis.png"
+                cv2.imwrite(str(out_vis), vis)
 
+        print(f"[OK] {img_path.name}")
+
+    print(f"\n[DONE] Results in: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()

@@ -430,19 +430,24 @@ class IdlePage(QtCore.QObject):
         if self.lblChosenModel:
             mp = getattr(self.state, "road_model_path", None)
             self.lblChosenModel.setText(os.path.basename(mp) if mp else "—")
-
         if self.lblMarkerDistVal and self.sldMarkerDist:
-            self.lblMarkerDistVal.setText(str(int(self.sldMarkerDist.value())))
+            self.lblMarkerDistVal.setText(f"{self.state.marker_target_side_m:.1f}")
         if self.lblMarkerTurnVal and self.sldMarkerTurnDist:
             self.lblMarkerTurnVal.setText(str(int(self.sldMarkerTurnDist.value())))
         if self.lblPoleSpacingVal and self.sldPoleSpacing:
             self.lblPoleSpacingVal.setText(str(int(self.sldPoleSpacing.value())))
     # -------------------- settings handlers --------------------
     def _on_marker_dist(self, v: int):
-        print("[IdlePage] marker_dist =", v)
-        self.state.marker_target_side_m = float(v)
+        dist_m = float(v) * 0.5
+        dist_m = max(0.5, min(5.0, dist_m))
+
+        print("[IdlePage] marker_target_side_m =", dist_m)
+
+        self.state.marker_target_side_m = dist_m
         self._save_idle_settings()
-        self._sync_labels()
+
+        if self.lblMarkerDistVal:
+            self.lblMarkerDistVal.setText(f"{dist_m:.1f}")
 
     def _on_marker_turn_dist(self, v: int):
         print("[IdlePage] marker_turn_dist =", v)
@@ -486,10 +491,11 @@ class IdlePage(QtCore.QObject):
             self.chkRails.setChecked(bool(self.state.rails_enabled))
 
         if self.sldMarkerDist:
-            self.sldMarkerDist.setMinimum(1)
-            self.sldMarkerDist.setMaximum(5)
+            self.sldMarkerDist.setMinimum(1)    # 0.5 м
+            self.sldMarkerDist.setMaximum(10)   # 5.0 м
+            self.sldMarkerDist.setSingleStep(1) # шаг = 0.5
             self.sldMarkerDist.setValue(
-                int(getattr(self.state, "marker_target_side_m", 2.0))
+                int(round(float(getattr(self.state, "marker_target_side_m", 2.0)) * 2))
             )
         if self.sldMarkerTurnDist:
             self.sldMarkerTurnDist.setMinimum(1)

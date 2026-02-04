@@ -232,7 +232,7 @@ class AppState:
 
          # --- Marker-based driving (AruCo) ---
         self.marker_mode: bool = True          # главный контур управления по знакам
-        self.marker_len_m: float = 0.178      
+        self.marker_len_m: float = 0.173   
 
         # last detection
         self.marker_seen: bool = False
@@ -286,3 +286,4 @@ class AppState:
         # minimal time between two pole pass events (seconds)
         self.marker_pass_cooldown_s: float = 0.8
 
+        self.aruco_center_crop_enable = False

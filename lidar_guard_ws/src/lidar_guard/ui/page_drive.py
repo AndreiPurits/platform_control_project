@@ -28,6 +28,7 @@ from robot_cmd import (
     update_drive_panel,
     apply_start_defaults,
     motors_set,
+    poll_arduino_startstop,
 )
 
 # === новые вынесенные подсистемы ===
@@ -453,7 +454,7 @@ class DrivePage(QtCore.QObject):
         st.search_behind_m = float(getattr(st, "junction_search_m", 10))
 
         # markers-only
-        st.marker_target_side_m = int(s.value("markers/marker_target_side_m", getattr(st, "marker_target_side_m", 2) or 2))
+        st.marker_target_side_m = float(s.value("markers/marker_target_side_m", getattr(st, "marker_target_side_m", 2.0) or 2.0))
         st.marker_turn_trigger_m = int(s.value("markers/marker_turn_trigger_m", getattr(st, "marker_turn_trigger_m", 4) or 4))
 
         # lock state (опционально сохранять)
@@ -496,8 +497,8 @@ class DrivePage(QtCore.QObject):
         s.setValue("road/road_center_bias", float(getattr(st, "road_center_bias", 0.06) or 0.06))
         s.setValue("road/seg_thr", float(getattr(st, "seg_thr", 0.35) or 0.35))
         s.setValue("road/junction_search_m", int(getattr(st, "junction_search_m", 10) or 10))
-
-        s.setValue("markers/marker_target_side_m", int(getattr(st, "marker_target_side_m", 2) or 2))
+        s.setValue("markers/marker_target_side_m",
+                float(getattr(st, "marker_target_side_m", 2.0) or 2.0))
         s.setValue("markers/marker_turn_trigger_m", int(getattr(st, "marker_turn_trigger_m", 4) or 4))
 
     # ---------------------------------------------------------------------
@@ -625,12 +626,12 @@ class DrivePage(QtCore.QObject):
         if self.lblSteerTauVal:
             self.lblSteerTauVal.setText(f"{tau:.2f}")
 
-        # PWM bias: -50..+50 stored in state.pwm_bias
+        # PWM bias: -10..+10 stored in state.pwm_bias
         pb = int(getattr(st, "pwm_bias", 0) or 0)
         pb = max(-10, min(10, pb))
         if self.sldSnapBefore:
             self.sldSnapBefore.blockSignals(True)
-            # диапазон должен быть -50..50 в ui
+            # диапазон должен быть -10..10 в ui
             self.sldSnapBefore.setValue(pb)
             self.sldSnapBefore.blockSignals(False)
         if self.lblSnapBeforeVal:
@@ -667,14 +668,19 @@ class DrivePage(QtCore.QObject):
             self.lblJuncSearchVal.setText(str(js))
 
         # markers: pole distance 1..5
-        pd = int(getattr(st, "marker_target_side_m", 2) or 2)
-        pd = max(1, min(5, pd))
+        pd = float(getattr(st, "marker_target_side_m", 2.0) or 2.0)
+        pd = max(0.5, min(5.0, pd))
+
         if self.sldPoleDistDrive:
+            self.sldPoleDistDrive.setMinimum(1)
+            self.sldPoleDistDrive.setMaximum(10)   # ← диапазон
+            self.sldPoleDistDrive.setSingleStep(1)
             self.sldPoleDistDrive.blockSignals(True)
-            self.sldPoleDistDrive.setValue(pd)
+            self.sldPoleDistDrive.setValue(int(round(pd * 2)))  # ← масштаб ×2
             self.sldPoleDistDrive.blockSignals(False)
+
         if self.lblPoleDistDriveVal:
-            self.lblPoleDistDriveVal.setText(f"{pd} м")
+            self.lblPoleDistDriveVal.setText(f"{pd:.1f} м")
 
         # markers: turn distance 1..8
         td = int(getattr(st, "marker_turn_trigger_m", 4) or 4)
@@ -757,7 +763,7 @@ class DrivePage(QtCore.QObject):
             self._sync_tuning_from_state()
             return
 
-        v = int(max(-50, min(50, int(v))))
+        v = int(max(-10, min(10, int(v))))
         self.state.pwm_bias = v
         if self.lblSnapBeforeVal:
             self.lblSnapBeforeVal.setText(str(v))
@@ -815,12 +821,15 @@ class DrivePage(QtCore.QObject):
             self._sync_tuning_from_state()
             return
 
-        v = int(max(1, min(5, int(v))))
-        self.state.marker_target_side_m = v
+        # v — это значение слайдера (×2)
+        dist_m = float(v) * 0.5
+        dist_m = max(0.5, min(5.0, dist_m))
+        self.state.marker_target_side_m = dist_m
         if self.lblPoleDistDriveVal:
-            self.lblPoleDistDriveVal.setText(f"{v} м")
-        self._tune_log("marker_target_side_m", v)
+            self.lblPoleDistDriveVal.setText(f"{dist_m:.1f} м")
+        self._tune_log("marker_target_side_m", f"{dist_m:.1f}")
         self._save_persisted_settings_debounced()
+
 
     def _on_turn_dist_changed(self, v: int):
         if bool(getattr(self.state, "tune_locked", True)):
@@ -878,7 +887,7 @@ class DrivePage(QtCore.QObject):
     # ---------------------------------------------------------------------
     def _on_startstop_toggled(self, checked: bool):
         print(f"[UI] StartStop toggled -> {checked}", flush=True)
-
+        self.video.reset_pole_snap_anchor(reason="user_start")
         # ---- запрет при ручном режиме ----
         if getattr(self.state, "manual_drive", False):
             if checked:
@@ -900,22 +909,37 @@ class DrivePage(QtCore.QObject):
             self.state.is_running = bool(checked)
             self._refresh_startstop_caption()
             self._update_controls()
+
+            if self.state.is_running:
+                # === ТОЧНО КАК В ОСТАЛЬНЫХ РЕЖИМАХ ===
+                try:
+                    self._load_persisted_settings()
+                    self._sync_tuning_from_state()
+                    apply_start_defaults(self.state)
+
+                    compute_controls_on_route(self.state, eps_px=2.0)
+                    start_route_animation(self.ui, self.state)
+
+                    if self._progress_timer and not self._progress_timer.isActive():
+                        self._progress_timer.start()
+
+                    # trajectory — ТОЛЬКО рулит PWM, не визуалкой
+                    self.trajectory.set_enabled(True)
+
+                except Exception as e:
+                    print("[TRAJ][START] error:", e, flush=True)
+            else:
+                try:
+                    self.trajectory.set_enabled(False)
+                    stop_route_animation(self.state, keep_progress=True)
+                except Exception:
+                    pass
+
             try:
-                self.trajectory.set_enabled(bool(checked))
+                update_drive_panel(self.ui, self.state)
             except Exception:
                 pass
-            return
 
-        # ---- legacy: если trajectory_mode true — не лезем ----
-        if getattr(self.state, "trajectory_mode", False):
-            # тут кнопка не должна управлять моторами
-            if self.btnStartStop:
-                self.btnStartStop.blockSignals(True)
-                self.btnStartStop.setChecked(False)
-                self.btnStartStop.blockSignals(False)
-            self.state.is_running = True
-            self._refresh_startstop_caption()
-            self._update_controls()
             return
 
         # ---- normal start/stop ----
@@ -954,6 +978,18 @@ class DrivePage(QtCore.QObject):
             except Exception as e:
                 print("[DRIVE] apply_start_defaults error:", e, flush=True)
 
+            # ✅ restore B если до STOP было включено
+            try:
+                if bool(getattr(self.state, "_b_restore_valid", False)):
+                    b_restore = int(getattr(self.state, "_b_restore_value", 1500) or 1500)
+                    # L/R уже выставлены в apply_start_defaults -> берём текущие
+                    l_now = int(getattr(self.state, "l_pwm", 1500) or 1500)
+                    r_now = int(getattr(self.state, "r_pwm", 1500) or 1500)
+                    motors_set(self.state, l_now, r_now, b_restore)
+                    print(f"[DRIVE] START → restore B={b_restore}", flush=True)
+                    self.state._b_restore_valid = False
+            except Exception as e:
+                print("[DRIVE] restore B error:", e, flush=True)
             # 4) подготовить контролы/анимацию
             try:
                 compute_controls_on_route(self.state, eps_px=2.0)
@@ -973,7 +1009,7 @@ class DrivePage(QtCore.QObject):
             except Exception:
                 pass
 
-            return  # ← КРИТИЧНО: чтобы никак не провалиться в STOP
+            return 
 
         # STOP
         try:
@@ -988,11 +1024,21 @@ class DrivePage(QtCore.QObject):
             pass
 
         try:
-            motors_set(self.state, 1500, 1500, None)
-            print("[DRIVE] STOP → нейтраль L=1500 R=1500", flush=True)
+            # ✅ если навесное было включено (B != 1500) — запомним и на STOP выключим
+            b_cur = int(getattr(self.state, "b_pwm", 1500) or 1500)
+            if b_cur != 1500:
+                self.state._b_restore_valid = True
+                self.state._b_restore_value = b_cur
+                motors_set(self.state, 1500, 1500, 1500)
+                print(f"[DRIVE] STOP → neutral L/R/B=1500 (saved B={b_cur})", flush=True)
+            else:
+                # было выключено — просто нейтраль
+                self.state._b_restore_valid = False
+                motors_set(self.state, 1500, 1500, 1500)
+                print("[DRIVE] STOP → neutral L/R/B=1500", flush=True)
+
         except Exception as e:
             print("[DRIVE] motors_set neutral error:", e, flush=True)
-
         try:
             stop_route_animation(self.state, keep_progress=True)
         except Exception:
@@ -1006,6 +1052,21 @@ class DrivePage(QtCore.QObject):
     # Progress timer
     # ---------------------------------------------------------------------
     def _on_progress_tick(self):
+        try:
+            def _set_startstop_from_hw(checked: bool):
+                want = bool(checked)
+                if self.btnStartStop:
+                    if bool(self.btnStartStop.isChecked()) == want:
+                        return
+                    self.btnStartStop.setChecked(want)
+                else:
+                    if bool(getattr(self.state, "is_running", False)) == want:
+                        return
+                    self._on_startstop_toggled(want)
+
+            poll_arduino_startstop(_set_startstop_from_hw)
+        except Exception:
+            pass
         try:
             self.dataset.on_progress_tick()
         except Exception:
@@ -1050,6 +1111,13 @@ class DrivePage(QtCore.QObject):
 
         self.state.is_running = False
         self.state.safety_stop = False
+
+        # ✅ глушим всё при уходе со страницы Drive
+        try:
+            motors_set(self.state, 1500, 1500, 1500)
+            print("[DRIVE] BACK → neutral L=1500 R=1500 B=1500", flush=True)
+        except Exception as e:
+            print("[DRIVE] BACK motors_set neutral error:", e, flush=True)
 
         try:
             from status import set_indicator
@@ -1333,7 +1401,7 @@ class DrivePage(QtCore.QObject):
 
         if getattr(self.state, "is_running", False) and not getattr(self.state, "trajectory_mode", False):
             try:
-                motors_set(self.state, base, base, None)
+                motors_set(self.state, base, base, self.state.b_pwm)
             except Exception as e:
                 print("[DRIVE] motors_set error on speed change:", e, flush=True)
 
@@ -1420,9 +1488,8 @@ class DrivePage(QtCore.QObject):
             self.video.shutdown()
         except Exception:
             pass
-
         try:
-            from robot_cmd import close_link
-            close_link()
-        except Exception:
-            pass
+            motors_set(self.state, 1500, 1500, 1500)
+            print("[DRIVE] shutdown → neutral L=1500 R=1500 B=1500", flush=True)
+        except Exception as e:
+            print("[DRIVE] shutdown motors_set neutral error:", e, flush=True)
