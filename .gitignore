@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# venv
+venv/
+.env/
+.venv/
+
+# ROS / build
+build/
+install/
+log/
+
+# datasets / images
+datasets/
+photos/
+*.jpg
+*.png
+
+# system
+.DS_Store
+
+# IDE
+.vscode/
+.cursor/
+
+# temp
+tmp/
+*.log
+
+# cache
+.cache/
+
+# camera debug artifacts
+*.mp4
+*.avi
