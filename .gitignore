@@ -1,3 +1,4 @@
+
 # Python
 __pycache__/
 *.pyc
@@ -36,3 +37,18 @@ tmp/
 # camera debug artifacts
 *.mp4
 *.avi
+# ROS 2 build artifacts
+**/build/
+**/install/
+**/log/
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# OS/IDE junk
+**/.DS_Store
+.vscode/
+.idea/
+

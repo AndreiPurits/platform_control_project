@@ -1,0 +1,16 @@
+lidar:
+  angle_min_deg: -135.0
+  angle_max_deg: 135.0
+  angle_step_deg: 0.5
+  range_min_m: 0.05
+  range_max_m: 30.0
+  noise_sigma_m: 0.02
+  rate_hz: 10.0
+  obstacles_dist_m: [2.0, 1.5]
+  obstacles_angle_deg: [0.0, -20.0]
+detector:
+  stop_distance_m: 1.5
+  caution_distance_m: 2.5
+  fov_guard_deg: 120.0
+  hysteresis_m: 0.2
+  print_debug: true
