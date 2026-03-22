@@ -14,7 +14,7 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(c1_launch),
             launch_arguments={
                 'serial_port': '/dev/ttyUSB0',
-                'serial_baudrate': '460800'
+                'serial_baudrate': '115200'
             }.items()
         ),
         Node(

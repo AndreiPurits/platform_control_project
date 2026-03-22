@@ -14,11 +14,14 @@ build/
 install/
 log/
 
-# datasets / images
+# datasets / images (общие каталоги)
 datasets/
 photos/
 *.jpg
 *.png
+# Исключения: ассеты UI и карты из репозитория
+!lidar_guard_ws/src/lidar_guard/ui/idle_images/*.png
+!lidar_guard_ws/src/lidar_guard/ui/maps_repo/*.png
 
 # system
 .DS_Store

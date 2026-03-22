@@ -3,19 +3,6 @@
  <class>PageIdle</class>
 
  <widget class="QWidget" name="pageIdle">
-  <property name="minimumSize">
-   <size>
-    <width>1920</width>
-    <height>1280</height>
-   </size>
-  </property>
-  <property name="maximumSize">
-   <size>
-    <width>1920</width>
-    <height>1280</height>
-   </size>
-  </property>
-
   <!-- ROOT: background + overlay -->
   <layout class="QStackedLayout" name="idleRootStack">
    <property name="stackingMode">

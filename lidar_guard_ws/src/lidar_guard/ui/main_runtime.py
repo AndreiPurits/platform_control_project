@@ -27,6 +27,12 @@ class Main(QtWidgets.QMainWindow):
 
         uic.loadUi(UI_PATH, self)
         self.setWindowTitle("Platform GUI")
+        # На всякий случай снимаем жёсткий дизайнерский размер (если .ui когда-то снова зафиксируют)
+        self.setMinimumSize(320, 240)
+        self.setMaximumSize(16777215, 16777215)
+        # Выход: Ctrl+Q, Ctrl+W
+        QtWidgets.QShortcut(QtGui.QKeySequence.Quit, self, activated=self.close)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+W"), self, activated=self.close)
         self.state = AppState()
 
         # базовые ссылки на ключевые виджеты/страницы
@@ -78,9 +84,6 @@ class Main(QtWidgets.QMainWindow):
                 self._load_map_file(last)   # helper, который ты уже добавлял/добавишь ниже
             except Exception as e:
                 print("[MAIN] autoload last map failed:", e, flush=True)
-
-        # стартуем в IDLE
-        self.to_idle()
 
         # стартуем в IDLE
         self.to_idle()
@@ -260,16 +263,18 @@ class Main(QtWidgets.QMainWindow):
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+    try:
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    except Exception:
+        pass
     app = QtWidgets.QApplication(sys.argv)
-    # небольшая косметика отрисовки на HiDPI
     app.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app.setApplicationName("Platform GUI")
 
     w = Main()
     app.aboutToQuit.connect(w.drive.shutdown)
-    w.setWindowFlags(QtCore.Qt.FramelessWindowHint)
-    w.setGeometry(0, 0, 1920, 1200)     # заполняем экран полностью
-    w.show()
+    # Рабочая область экрана (любое разрешение), не фиксированный 1920×1280 из Designer
+    w.showMaximized()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":

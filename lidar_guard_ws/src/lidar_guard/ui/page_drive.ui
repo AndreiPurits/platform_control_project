@@ -2,26 +2,6 @@
 <ui version="4.0">
  <class>pageDrive</class>
  <widget class="QWidget" name="pageDrive">
-  <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>1920</width>
-    <height>1200</height>
-   </rect>
-  </property>
-  <property name="minimumSize">
-   <size>
-    <width>1920</width>
-    <height>1200</height>
-   </size>
-  </property>
-  <property name="maximumSize">
-   <size>
-    <width>1920</width>
-    <height>1200</height>
-   </size>
-  </property>
   <layout class="QVBoxLayout" name="driveRootLayout">
    <property name="spacing">
     <number>10</number>

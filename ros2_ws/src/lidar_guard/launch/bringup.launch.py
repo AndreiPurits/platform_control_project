@@ -1,15 +1,23 @@
 import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
-    # Параметры лидара
-    default_port = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8200a3a9df73ef11b5d7c68c8fcc3fa0-if00-port0"
+    # Порт по умолчанию: LIDAR_SERIAL_PORT из окружения или старый by-id CP2102.
+    # Если 80008004 на всех baud — часто открыт не тот USB (тот же CP2102 у Arduino и т.д.): задай порт явно.
+    _fallback_by_id = (
+        "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_"
+        "8200a3a9df73ef11b5d7c68c8fcc3fa0-if00-port0"
+    )
+    default_port = os.environ.get("LIDAR_SERIAL_PORT", _fallback_by_id)
 
     lidar_port_arg = DeclareLaunchArgument('lidar_port', default_value=default_port)
-    lidar_baud_arg = DeclareLaunchArgument('lidar_baud', default_value='460800')
+    lidar_baud_arg = DeclareLaunchArgument('lidar_baud', default_value='115200')
     lidar_port = LaunchConfiguration('lidar_port')
     lidar_baud = LaunchConfiguration('lidar_baud')
 
@@ -22,9 +30,9 @@ def generate_launch_description():
         output='screen'
     )
 
-    # 2) Твой мост /scan -> UDP:10000
-    # Если в скрипте другой путь/порт — поправь ниже строку path_br и/или сам скрипт.
-    path_br = '/home/andrei/ros2_ws/src/lidar_guard/ui/ros2_to_udp_bridge.py'
+    # 2) Мост /scan -> UDP (скрипты из share после colcon install)
+    pkg_share = get_package_share_directory('lidar_guard')
+    path_br = os.path.join(pkg_share, 'ui', 'ros2_to_udp_bridge.py')
     scan_to_udp = ExecuteProcess(
         cmd=['python3', path_br],
         output='screen',
@@ -33,7 +41,7 @@ def generate_launch_description():
     )
 
     # 3) GUI
-    gui_path = '/home/andrei/ros2_ws/src/lidar_guard/ui/main_runtime.py'
+    gui_path = os.path.join(pkg_share, 'ui', 'main_runtime.py')
     gui = ExecuteProcess(
         cmd=['python3', gui_path],
         output='screen',

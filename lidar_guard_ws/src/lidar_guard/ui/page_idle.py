@@ -255,8 +255,8 @@ class IdlePage(QtCore.QObject):
         if not self.lblBg or self._bg_src_pm is None or self._bg_src_pm.isNull():
             return
 
-        w = max(1920, self.lblBg.width())
-        h = max(1280, self.lblBg.height())
+        w = max(1, self.lblBg.width())
+        h = max(1, self.lblBg.height())
 
         pm = self._bg_src_pm.scaled(
             w, h,

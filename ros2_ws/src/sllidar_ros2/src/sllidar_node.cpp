@@ -39,6 +39,7 @@
 #include "math.h"
 
 #include <signal.h>
+#include <vector>
 
 #ifndef _countof
 #define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
@@ -105,6 +106,10 @@ class SLlidarNode : public rclcpp::Node
         if (SL_IS_FAIL(op_result)) {
             if (op_result == SL_RESULT_OPERATION_TIMEOUT) {
                 RCLCPP_ERROR(this->get_logger(),"Error, operation time out. SL_RESULT_OPERATION_TIMEOUT! ");
+            } else if (op_result == SL_RESULT_OPERATION_NOT_SUPPORT) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Error, SL_RESULT_OPERATION_NOT_SUPPORT (%x): wrong serial baud or not a Slamtec lidar on this port.",
+                    op_result);
             } else {
                 RCLCPP_ERROR(this->get_logger(),"Error, unexpected error, code: %x",op_result);
             }
@@ -264,34 +269,89 @@ public:
     
         sl_result     op_result;
 
-        // create the driver instance
-        drv = *createLidarDriver();
-        IChannel* _channel;
+        auto build_serial_baud_candidates = [](int preferred) {
+            const int defaults[] = {115200, 460800, 256000, 1000000, 921600, 500000, 128000};
+            std::vector<int> out;
+            out.push_back(preferred);
+            for (int b : defaults) {
+                if (b != preferred) {
+                    out.push_back(b);
+                }
+            }
+            return out;
+        };
+
+        drv = nullptr;
+        IChannel* _channel = nullptr;
+
         if(channel_type == "tcp"){
+            drv = *createLidarDriver();
             _channel = *createTcpChannel(tcp_ip, tcp_port);
+            if (SL_IS_FAIL(drv->connect(_channel))) {
+                RCLCPP_ERROR(this->get_logger(),"Error, cannot connect to the ip addr  %s with the tcp port %s.",tcp_ip.c_str(),std::to_string(tcp_port).c_str());
+                delete drv;
+                drv = nullptr;
+                return -1;
+            }
         }
         else if(channel_type == "udp"){
+            drv = *createLidarDriver();
             _channel = *createUdpChannel(udp_ip, udp_port);
+            if (SL_IS_FAIL(drv->connect(_channel))) {
+                RCLCPP_ERROR(this->get_logger(),"Error, cannot connect to the ip addr  %s with the udp port %s.",udp_ip.c_str(),std::to_string(udp_port).c_str());
+                delete drv;
+                drv = nullptr;
+                return -1;
+            }
         }
         else{
-            _channel = *createSerialPortChannel(serial_port, serial_baudrate);
-        }
-        if (SL_IS_FAIL((drv)->connect(_channel))) {
-            if(channel_type == "tcp"){
-                RCLCPP_ERROR(this->get_logger(),"Error, cannot connect to the ip addr  %s with the tcp port %s.",tcp_ip.c_str(),std::to_string(tcp_port).c_str());
+            /* Serial: wrong baud often yields SL_RESULT_OPERATION_NOT_SUPPORT on getDeviceInfo. */
+            std::vector<int> bauds = build_serial_baud_candidates(serial_baudrate);
+            sl_result last_probe = SL_RESULT_OPERATION_FAIL;
+            bool serial_ready = false;
+            for (int baud : bauds) {
+                if (drv) {
+                    delete drv;
+                    drv = nullptr;
+                }
+                drv = *createLidarDriver();
+                _channel = *createSerialPortChannel(serial_port, baud);
+                if (SL_IS_FAIL(drv->connect(_channel))) {
+                    RCLCPP_WARN(this->get_logger(), "Serial open failed at %d baud on %s", baud, serial_port.c_str());
+                    delete drv;
+                    drv = nullptr;
+                    continue;
+                }
+                sl_lidar_response_device_info_t probe_info{};
+                last_probe = drv->getDeviceInfo(probe_info);
+                if (SL_IS_OK(last_probe)) {
+                    serial_baudrate = baud;
+                    RCLCPP_INFO(this->get_logger(), "Lidar answered getDeviceInfo at %d baud (serial)", baud);
+                    serial_ready = true;
+                    break;
+                }
+                RCLCPP_WARN(this->get_logger(), "getDeviceInfo failed at %d baud: %x — trying next baud", baud, last_probe);
+                drv->disconnect();
+                delete drv;
+                drv = nullptr;
             }
-            else if(channel_type == "udp"){
-                RCLCPP_ERROR(this->get_logger(),"Error, cannot connect to the ip addr  %s with the udp port %s.",udp_ip.c_str(),std::to_string(udp_port).c_str());
+            if (!serial_ready) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Error, could not read lidar on %s after trying multiple baud rates. Last code: %x. Check cable, power, dialout group, correct /dev node.",
+                    serial_port.c_str(), last_probe);
+                if (drv) {
+                    delete drv;
+                    drv = nullptr;
+                }
+                return -1;
             }
-            else{
-                RCLCPP_ERROR(this->get_logger(),"Error, cannot bind to the specified serial port %s.",serial_port.c_str());            
-            }
-            delete drv;
-            return -1;
         }
         
         // get sllidar device info
         if (!getSLLIDARDeviceInfo(drv)) {
+            drv->disconnect();
+            delete drv;
+            drv = nullptr;
             return -1;
         }
 
