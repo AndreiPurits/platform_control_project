@@ -1,4 +1,5 @@
 import os
+import glob
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -8,13 +9,30 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Порт по умолчанию: LIDAR_SERIAL_PORT из окружения или старый by-id CP2102.
-    # Если 80008004 на всех baud — часто открыт не тот USB (тот же CP2102 у Arduino и т.д.): задай порт явно.
-    _fallback_by_id = (
-        "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_"
-        "8200a3a9df73ef11b5d7c68c8fcc3fa0-if00-port0"
-    )
-    default_port = os.environ.get("LIDAR_SERIAL_PORT", _fallback_by_id)
+    # Порт по умолчанию: из окружения или авто-детект.
+    # Важно: by-id у CP210x меняется между устройствами, поэтому жёсткий путь ломается.
+    env_port = os.environ.get("LIDAR_SERIAL_PORT", "").strip()
+
+    def _pick_default_lidar_port() -> str:
+        # 1) стабильный симлинк (если настроен udev)
+        if os.path.exists("/dev/rplidar"):
+            return "/dev/rplidar"
+
+        # 2) первый CP210x по by-id (самый частый вариант для RPLidar)
+        for p in sorted(glob.glob("/dev/serial/by-id/*")):
+            name = os.path.basename(p).lower()
+            if "silicon_labs" in name or "cp210" in name:
+                return p
+
+        # 3) fallback на ttyUSB0 (если нет by-id)
+        usb = sorted(glob.glob("/dev/ttyUSB*"))
+        if usb:
+            return usb[0]
+
+        # 4) последний шанс — стандартный путь (пусть будет видно в логах)
+        return "/dev/ttyUSB0"
+
+    default_port = env_port if env_port else _pick_default_lidar_port()
 
     lidar_port_arg = DeclareLaunchArgument('lidar_port', default_value=default_port)
     lidar_baud_arg = DeclareLaunchArgument('lidar_baud', default_value='115200')

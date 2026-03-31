@@ -3,6 +3,7 @@
 from typing import List, Tuple, Optional
 from PyQt5 import QtWidgets
 import os
+import glob
 class AppState:
     def __init__(self):
         # Карта
@@ -213,9 +214,14 @@ class AppState:
         self.mainline_follow_w = 1.0
         self.mainline_post_turn_off_s = 1.0
 
-        self.cam_device = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1:1.0-video-index0"    
-        # или by-path (ещё стабильнее к порту):
-        # "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0"        
+        # Камера: авто-детект в VideoController (drive_video.py).
+        # Здесь НЕ задаём жёсткие пути вида /dev/v4l/* (на разных платформах они разные).
+        # Можно переопределить через env как индекс (например "0").
+        env_cam = (os.environ.get("ROVER_CAM_INDEX") or os.environ.get("CAM_INDEX") or "").strip()
+        try:
+            self.cam_device = int(env_cam) if env_cam != "" else None
+        except Exception:
+            self.cam_device = None
         self.cam_open_timeout_s = 2.0
         self.cam_reopen_cooldown_s = 0.4
         self.force_mainline_only = True

@@ -196,9 +196,9 @@ class DrivePage(QtCore.QObject):
             self.radarViewDrive.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
             self.radarViewDrive.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
 
-        # camera device path (stable by-path)
+        # camera is auto-detected in VideoController; keep state.cam_device optional
         if not hasattr(self.state, "cam_device"):
-            self.state.cam_device = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0"
+            self.state.cam_device = None
 
         # ---- debounced save (QSettings) ----
         self._save_timer = QtCore.QTimer(self)

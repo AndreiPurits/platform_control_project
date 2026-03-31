@@ -34,6 +34,9 @@ photos/
 tmp/
 *.log
 
+# markdown working files
+*.md
+
 # cache
 .cache/
 

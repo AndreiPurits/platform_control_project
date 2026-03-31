@@ -315,7 +315,7 @@ class VideoController(QtCore.QObject):
     def _ensure_camera_for_current_mode(self) -> bool:
         nav_mode = self._current_nav_mode()
         w, h, fps = self._profile_for_mode(nav_mode)
-        dev = getattr(self.state, "cam_device", 0)
+        dev = getattr(self.state, "cam_device", None)
 
         prof = (nav_mode, int(w), int(h), int(fps), str(dev))
         if self._cam_last_open_profile == prof and self._cam is not None and self._cam.isOpened():
@@ -339,46 +339,164 @@ class VideoController(QtCore.QObject):
         return ok
 
     def _open_camera(self, dev, w: int, h: int, fps: int) -> bool:
-        # dev may be /dev/v4l/by-id/... path or int
-        if isinstance(dev, str) and dev.startswith("/"):
-            if not os.path.exists(dev):
-                self.state.camera_available = False
-                return False
-            open_dev = dev
-        else:
-            open_dev = int(dev)
+        """
+        Raspberry Pi-friendly camera open:
+        - No hardcoded /dev/v4l/* paths.
+        - Auto-detect first working /dev/video0..4 (unless dev index provided).
+        - Try 4K via direct OpenCV; if fails, try GStreamer pipeline; then fallback to 1080p.
+        """
 
-        try:
-            cap = cv2.VideoCapture(open_dev, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-            cap.set(cv2.CAP_PROP_FPS, int(fps))
+        def _log_cap_selected(video_index: int):
+            try:
+                print(f"[CAM] selected device: /dev/video{int(video_index)}", flush=True)
+            except Exception:
+                pass
 
-            ok, fr = cap.read()
-            if not ok or fr is None:
-                cap.release()
-                time.sleep(0.25)
-                cap = cv2.VideoCapture(open_dev, cv2.CAP_V4L2)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-                cap.set(cv2.CAP_PROP_FPS, int(fps))
-                ok, fr = cap.read()
+        def _cap_real_mode(cap: "cv2.VideoCapture") -> tuple[int, int, float]:
+            try:
+                rw = int(round(float(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)))
+                rh = int(round(float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)))
+                rf = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                return (rw, rh, rf)
+            except Exception:
+                return (0, 0, 0.0)
 
-            if (not cap.isOpened()) or (not ok) or (fr is None):
+        def _try_open_index(index: int, ww: int, hh: int, ff: int) -> tuple[bool, "cv2.VideoCapture|None", "object|None", str]:
+            """Direct OpenCV open by index (universal for PC & RPi)."""
+            try:
+                cap = cv2.VideoCapture(int(index))
                 try:
-                    cap.release()
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(ww))
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(hh))
+                    cap.set(cv2.CAP_PROP_FPS, int(ff))
                 except Exception:
                     pass
+                ok, fr = cap.read()
+                if (not cap.isOpened()) or (not ok) or (fr is None):
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    return (False, None, None, "opencv-index")
+                return (True, cap, fr, "opencv-index")
+            except Exception:
+                return (False, None, None, "opencv-index")
+
+        def _gst_pipeline(video_index: int, ww: int, hh: int, ff: int) -> str:
+            """
+            GStreamer fallback. We try MJPEG first (common for USB cams), then raw.
+            Note: CAP_GSTREAMER must be enabled in OpenCV build for this to work.
+            """
+            dev_path = f"/dev/video{int(video_index)}"
+            # MJPEG → decode → appsink
+            return (
+                f"v4l2src device={dev_path} ! "
+                f"image/jpeg,width={int(ww)},height={int(hh)},framerate={int(ff)}/1 ! "
+                f"jpegdec ! videoconvert ! "
+                f"appsink drop=1 sync=false max-buffers=1"
+            )
+
+        def _try_open_gst(video_index: int, ww: int, hh: int, ff: int) -> tuple[bool, "cv2.VideoCapture|None", "object|None", str]:
+            pipe = _gst_pipeline(video_index, ww, hh, ff)
+            try:
+                cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+                ok, fr = cap.read()
+                if (not cap.isOpened()) or (not ok) or (fr is None):
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    return (False, None, None, "gstreamer")
+                return (True, cap, fr, "gstreamer")
+            except Exception:
+                return (False, None, None, "gstreamer")
+
+        def _autodetect_index(prefer: Optional[int]) -> Optional[int]:
+            """
+            Requirement: probe /dev/video0..4 and pick the first camera that works.
+            If prefer is set, try it first.
+            """
+            cand = []
+            if prefer is not None:
+                cand.append(int(prefer))
+            for i in range(5):
+                if i not in cand:
+                    cand.append(i)
+
+            # lightweight probe first (faster & more compatible)
+            for i in cand:
+                ok, cap, fr, _ = _try_open_index(i, 640, 480, 30)
+                if ok:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    return int(i)
+            return None
+
+        # normalize dev to optional index
+        prefer_index: Optional[int] = None
+        if dev is None:
+            prefer_index = None
+        elif isinstance(dev, (int, np.integer)):
+            prefer_index = int(dev)
+        else:
+            # accept "0"/"1" from settings/env; ignore any /dev/v4l/* paths
+            try:
+                prefer_index = int(str(dev).strip())
+            except Exception:
+                prefer_index = None
+
+        idx = _autodetect_index(prefer_index)
+        if idx is None:
+            self.state.camera_available = False
+            print("[CAM] no camera found in /dev/video0..4", flush=True)
+            return False
+
+        _log_cap_selected(idx)
+        # persist chosen index so the rest of app sees stable value for this run
+        try:
+            self.state.cam_device = int(idx)
+        except Exception:
+            pass
+
+        try:
+            # 1) Try 4K direct
+            ok, cap, fr, how = _try_open_index(idx, 3840, 2160, 30)
+            if not ok:
+                time.sleep(0.25)
+                ok, cap, fr, how = _try_open_index(idx, 3840, 2160, 30)
+
+            # 2) If 4K direct failed -> try 4K via GStreamer
+            if not ok:
+                ok, cap, fr, how = _try_open_gst(idx, 3840, 2160, 30)
+
+            # 3) If still failed -> fallback to 1080p direct
+            if not ok:
+                ok, cap, fr, how = _try_open_index(idx, 1920, 1080, 30)
+                if not ok:
+                    time.sleep(0.15)
+                    ok, cap, fr, how = _try_open_index(idx, 1920, 1080, 30)
+
+            # 4) If still failed -> 1080p via GStreamer
+            if not ok:
+                ok, cap, fr, how = _try_open_gst(idx, 1920, 1080, 30)
+
+            if not ok or cap is None or fr is None:
                 self.state.camera_available = False
-                print(f"[CAM] open failed: dev={open_dev} w={w} h={h} fps={fps} ok={ok}", flush=True)
+                print(f"[CAM] open failed: dev=/dev/video{idx} (tried 4K->gst4K->1080p)", flush=True)
                 return False
 
             self._cam = cap
             self.state._cam = cap
             self.state.camera_available = True
-            print(f"[CAM] opened: dev={open_dev} shape={fr.shape} profile=({w}x{h}@{fps})", flush=True)
+            rw, rh, rf = _cap_real_mode(cap)
+            print(
+                f"[CAM] opened: dev=/dev/video{idx} via={how} "
+                f"real=({rw}x{rh}@{rf:.1f}) frame={getattr(fr,'shape',None)}",
+                flush=True,
+            )
             return True
 
         except Exception as e:
